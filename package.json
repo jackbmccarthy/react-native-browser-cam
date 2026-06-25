@@ -1,0 +1,73 @@
+{
+  "name": "react-native-browser-cam",
+  "version": "0.0.1",
+  "description": "React Native library for compositing a browser overlay over camera and streaming via RTMP",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "react-native": "src/index.tsx",
+  "types": "dist/index.d.ts",
+  "files": [
+    "android/build.gradle",
+    "android/src/main",
+    "dist",
+    "ios",
+    "src",
+    "app.plugin.js",
+    "react-native-browser-cam.podspec",
+    "README.md",
+    "PROJECT_OVERVIEW.md",
+    "ARCHITECTURE.md",
+    "DEPENDENCIES.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "jest",
+    "lint": "eslint .",
+    "build": "tsc",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "react-native",
+    "expo",
+    "camera",
+    "webview",
+    "rtmp",
+    "streaming",
+    "live-stream",
+    "overlay",
+    "broadcast"
+  ],
+  "author": "Jack McCarthy",
+  "license": "MIT",
+  "homepage": "https://github.com/jackbmccarthy/react-native-browser-cam#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jackbmccarthy/react-native-browser-cam.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jackbmccarthy/react-native-browser-cam/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "expo": ">=48.0.0",
+    "react": ">=18.0.0",
+    "react-native": ">=0.70.0"
+  },
+  "peerDependenciesMeta": {
+    "expo": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@expo/config-plugins": "^54.0.4",
+    "@types/react": "^18.0.0",
+    "react": "18.2.0",
+    "react-native": "0.74.1",
+    "typescript": "^5.0.0"
+  },
+  "expo": {
+    "plugin": "./app.plugin.js"
+  }
+}
