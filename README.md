@@ -13,8 +13,8 @@ Then use [ARCHITECTURE.md](ARCHITECTURE.md) for native implementation details an
 
 | Platform | Status |
 | --- | --- |
-| iOS | Tested on device; RTMP streaming and local recording appear to be working |
-| Android | Native API scaffold exists, but Android has not been tested yet |
+| iOS | Tested on device; RTMP streaming, local recording, camera selection, focus, and audio metering are implemented |
+| Android | Tested on a physical Pixel; CameraX preview, browser composition, RTMP streaming, local recording with audio, and audio metering are implemented |
 | Expo | Supported through config plugin + development builds |
 | Expo Go | Not supported |
 | Web | Not supported |
@@ -23,7 +23,10 @@ Then use [ARCHITECTURE.md](ARCHITECTURE.md) for native implementation details an
 
 - Composites `WKWebView` / native web overlay content over live camera video
 - Streams the composited output to RTMP endpoints such as YouTube
-- Records the composited output locally on iOS
+- Records the composited output locally on iOS and Android
+- Enumerates native camera and microphone devices
+- Reports microphone levels, stream state, and publishing statistics
+- Reconnects interrupted RTMP sessions when network connectivity returns
 - Exposes a single `BrowserCamView` component for React Native and Expo apps
 
 ## Expo Integration
@@ -56,7 +59,7 @@ npx expo run:ios
 
 - iOS Simulator does not provide a real camera capture path for this library, so end-to-end camera/stream testing still needs a physical iPhone or iPad.
 - Expo Camera can work in Expo Go because it is part of the Expo SDK. This library cannot, because it ships custom native code.
-- Once Android streaming is implemented, Android Emulator testing should be practical, but Android is not ready yet.
+- Use physical Android hardware for camera, microphone, orientation, and RTMP validation. Emulator testing is useful for bridge and layout checks only.
 
 ## React Native CLI
 
@@ -159,7 +162,9 @@ export default function StreamScreen() {
       cameraConfig={{
         facing: 'back',
         fps: 30,
-        orientation: 'portrait',
+        resolution: '1080p',
+        orientation: 'landscape',
+        autoFocusEnabled: true,
       }}
       webViewConfig={{
         url: overlayUrl,
@@ -172,9 +177,9 @@ export default function StreamScreen() {
       }}
       streamConfig={{
         url: streamUrl,
-        width: 1080,
-        height: 1920,
-        bitrate: 4_500_000,
+        width: 1920,
+        height: 1080,
+        bitrate: 5_500_000,
         audioBitrate: 128_000,
         audioSampleRate: 44_100,
         keyFrameInterval: 2,
@@ -227,8 +232,8 @@ export function CameraComposer({
 
 ## Key Props
 
-- `cameraConfig`: camera facing, frame rate, enabled state, orientation
-- `webViewConfig`: overlay URL, transparency, injected JS, layout rectangle
+- `cameraConfig`: camera facing/device, resolution, frame rate, focus, audio input, enabled state, and orientation
+- `webViewConfig`: overlay URL, transparency, injected JS, viewport, zoom, and layout rectangle
 - `streamConfig`: RTMP URL, dimensions, video bitrate, audio bitrate
 - `recordingConfig`: output settings for local recording
 
@@ -242,14 +247,31 @@ All runtime values should be passed in through these config props. Avoid hard-co
 - `stopRecording()`
 - `snapshot()`
 - `switchCamera()`
+- `focusAtPoint(x, y)`
 - `reloadWebView()`
 - `loadUrl(url)`
 - `injectJavaScript(js)`
 - `setMuted(muted)`
 
 Some result-returning methods still need tighter native-to-JS promise plumbing.
-Today the native iOS side can create snapshot and recording paths, but the JS
-wrapper dispatches most methods as view-manager commands and may return placeholders.
+The native implementations can create snapshot and recording paths, but the JS
+wrapper still dispatches most view methods as commands and may return placeholders.
+
+## Device Discovery And Audio Levels
+
+```tsx
+import {
+  AudioDeviceUtils,
+  CameraDeviceUtils,
+} from 'react-native-browser-cam';
+
+const cameras = await CameraDeviceUtils.getAvailableCameras();
+const microphones = await AudioDeviceUtils.getAvailableAudioInputs();
+```
+
+Pass a selected camera ID through `cameraConfig.deviceId` and a selected microphone
+ID through `cameraConfig.audioInputId`. Use `onAudioLevel` for a normalized input
+level and approximate dBFS value while the native audio path is active.
 
 ## Permissions
 
@@ -260,13 +282,9 @@ The config plugin adds these permissions automatically:
 
 ## Release Guidance
 
-If you publish this package today, describe it as:
-
-- iOS-first, with successful device testing so far
-- Expo development-build compatible
-- Android support pending implementation/testing
-
-Do not market it as fully cross-platform until Android RTMP and recording are implemented.
+The library now has device-tested iOS and Android paths. Before a release, repeat
+camera, recording, and RTMP tests on the target hardware and streaming provider;
+native capture behavior still varies across devices and OS versions.
 
 ## License
 

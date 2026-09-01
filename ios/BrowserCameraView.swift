@@ -48,14 +48,21 @@ public class BrowserCameraView: UIView {
     /// Diagnostic counters
     private var cameraFrameCount: Int = 0
     private var compositeFrameCount: Int = 0
+    private var followsDeviceOrientation: Bool = true
+    private var orientationMode: String = "auto"
+    private var isAudioMuted: Bool = false
+    private var lastAudioLevelEmitTime: CFTimeInterval = 0
     
     /// React Native event callbacks
     @objc public var onStreamStateChange: RCTDirectEventBlock?
     @objc public var onStreamStats: RCTDirectEventBlock?
+    @objc public var onAudioLevel: RCTDirectEventBlock?
     @objc public var onError: RCTDirectEventBlock?
     @objc public var onWebViewLoad: RCTDirectEventBlock?
     @objc public var onWebViewError: RCTDirectEventBlock?
     @objc public var onCameraReady: RCTDirectEventBlock?
+    @objc public var onRecordingStateChange: RCTDirectEventBlock?
+    @objc public var onRecordingFinished: RCTDirectEventBlock?
     @objc public var onLog: RCTDirectEventBlock?
     
     // MARK: - Configuration Properties (set from React Native)
@@ -156,9 +163,13 @@ public class BrowserCameraView: UIView {
     }
     
     @objc private func handleOrientationChange() {
-        let deviceOrientation = UIDevice.current.orientation
+        guard followsDeviceOrientation else { return }
 
-        if let orientation = captureOrientation(for: deviceOrientation) {
+        let orientation = orientationMode == "landscape"
+            ? currentCaptureOrientation(landscapeOnly: true)
+            : currentCaptureOrientation(landscapeOnly: false)
+
+        if let orientation = orientation {
             print("[BrowserCameraView] 📱 Device orientation changed to: \(orientation.rawValue)")
             applyCaptureOrientation(orientation)
         }
@@ -168,8 +179,24 @@ public class BrowserCameraView: UIView {
         guard let session = cameraService?.getCaptureSession() else { return }
         
         DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+
             print("[BrowserCameraView] Attaching session to preview layer")
-            self?.previewLayer?.session = session
+            self.previewLayer?.session = session
+            self.applyPreviewOrientation()
+        }
+    }
+
+    private func applyPreviewOrientation() {
+        let orientation = cameraService?.orientation ?? .landscapeRight
+
+        if let connection = previewLayer?.connection, connection.isVideoOrientationSupported {
+            connection.videoOrientation = orientation
+        }
+
+        if let connection = previewLayer?.connection, connection.isVideoMirroringSupported {
+            connection.automaticallyAdjustsVideoMirroring = false
+            connection.isVideoMirrored = false
         }
     }
     
@@ -177,9 +204,18 @@ public class BrowserCameraView: UIView {
         if isRecording {
             _ = streamService?.stopRecording()
         }
-        cameraService?.stop()
+
+        let camera = cameraService
+        cameraService = nil
+        camera?.delegate = nil
+        previewLayer?.session = nil
+        camera?.stop()
+
+        webOverlayService?.delegate = nil
         webOverlayService?.stopCapture()
+        compositorService?.delegate = nil
         compositorService?.stop()
+        streamService?.delegate = nil
         streamService?.disconnect()
         NotificationCenter.default.removeObserver(self)
         UIDevice.current.endGeneratingDeviceOrientationNotifications()
@@ -191,28 +227,55 @@ public class BrowserCameraView: UIView {
     private func updateCameraConfig() {
         guard let config = cameraConfig else { return }
         
-        // Parse camera facing
-        if let facing = config["facing"] as? String {
-            if (facing == "front" && cameraService != nil) {
-                // Will switch on next start if not already front
-            } else if (facing == "back" && cameraService != nil) {
-                // Will switch on next start if not already back
+        // Parse concrete camera device first, then fall back to facing.
+        // JS may send "front"/"back" as fallback ids when native enumeration is unavailable.
+        if let deviceId = config["deviceId"] as? String, !deviceId.isEmpty {
+            if deviceId == "front" {
+                cameraService?.setCameraPosition(.front)
+            } else if deviceId == "back" {
+                cameraService?.setCameraPosition(.back)
+            } else {
+                cameraService?.setCameraDevice(deviceId)
             }
+        } else if let facing = config["facing"] as? String {
+            if facing == "front" {
+                cameraService?.setCameraPosition(.front)
+            } else if facing == "back" {
+                cameraService?.setCameraPosition(.back)
+            }
+        }
+
+        // Parse capture resolution
+        if let resolution = config["resolution"] as? String {
+            cameraService?.setSessionPreset(resolution)
+        }
+
+        // Parse preferred audio input
+        if let audioInputId = config["audioInputId"] as? String {
+            cameraService?.setAudioInput(audioInputId)
         }
         
         // Parse orientation
         if let orientationStr = config["orientation"] as? String {
+            orientationMode = orientationStr
+            followsDeviceOrientation = orientationStr == "auto" || orientationStr == "landscape"
             if let orientation = resolveCaptureOrientation(from: orientationStr) {
                 applyCaptureOrientation(orientation)
             }
         } else {
-            // No explicit orientation in config - handleOrientationChange will handle it based on device
+            orientationMode = "auto"
+            followsDeviceOrientation = true
+            handleOrientationChange()
         }
         
         // Parse frame rate
         if let fps = config["fps"] as? Int {
             cameraService?.setFrameRate(fps)
         }
+
+        // Parse autofocus preference. Default to continuous autofocus for live camera use.
+        let autoFocusEnabled = config["autoFocusEnabled"] as? Bool ?? true
+        cameraService?.setAutoFocusEnabled(autoFocusEnabled)
         
         // Parse enabled state (default to true if config is set, unless explicitly false)
         let enabled = config["enabled"] as? Bool ?? true
@@ -242,7 +305,7 @@ public class BrowserCameraView: UIView {
     private func resolveCaptureOrientation(from orientation: String) -> AVCaptureVideoOrientation? {
         switch orientation {
         case "auto":
-            return captureOrientation(for: UIDevice.current.orientation)
+            return currentCaptureOrientation(landscapeOnly: false)
         case "portrait":
             return .portrait
         case "portraitUpsideDown":
@@ -252,7 +315,55 @@ public class BrowserCameraView: UIView {
         case "landscapeRight":
             return .landscapeRight
         case "landscape":
-            return captureOrientation(for: UIDevice.current.orientation) ?? cameraService?.orientation ?? .landscapeRight
+            return currentCaptureOrientation(landscapeOnly: true) ?? cameraService?.orientation ?? .landscapeRight
+        default:
+            return nil
+        }
+    }
+
+    private func currentCaptureOrientation(landscapeOnly: Bool) -> AVCaptureVideoOrientation? {
+        if let interfaceOrientation = currentInterfaceOrientation(),
+           let captureOrientation = captureOrientation(for: interfaceOrientation),
+           !landscapeOnly || captureOrientation == .landscapeLeft || captureOrientation == .landscapeRight {
+            return captureOrientation
+        }
+
+        if let captureOrientation = captureOrientation(for: UIDevice.current.orientation),
+           !landscapeOnly || captureOrientation == .landscapeLeft || captureOrientation == .landscapeRight {
+            return captureOrientation
+        }
+
+        if landscapeOnly,
+           let currentOrientation = cameraService?.orientation,
+           currentOrientation == .landscapeLeft || currentOrientation == .landscapeRight {
+            return currentOrientation
+        }
+
+        return nil
+    }
+
+    private func currentInterfaceOrientation() -> UIInterfaceOrientation? {
+        if let orientation = window?.windowScene?.interfaceOrientation,
+           orientation != .unknown {
+            return orientation
+        }
+
+        return UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive }?
+            .interfaceOrientation
+    }
+
+    private func captureOrientation(for interfaceOrientation: UIInterfaceOrientation) -> AVCaptureVideoOrientation? {
+        switch interfaceOrientation {
+        case .portrait:
+            return .portrait
+        case .portraitUpsideDown:
+            return .portraitUpsideDown
+        case .landscapeLeft:
+            return .landscapeLeft
+        case .landscapeRight:
+            return .landscapeRight
         default:
             return nil
         }
@@ -265,10 +376,9 @@ public class BrowserCameraView: UIView {
         case .portraitUpsideDown:
             return .portraitUpsideDown
         case .landscapeLeft:
-            // UIDevice and AVCapture use opposite left/right semantics.
-            return .landscapeRight
-        case .landscapeRight:
             return .landscapeLeft
+        case .landscapeRight:
+            return .landscapeRight
         default:
             return nil
         }
@@ -280,6 +390,11 @@ public class BrowserCameraView: UIView {
         DispatchQueue.main.async { [weak self] in
             if let connection = self?.previewLayer?.connection, connection.isVideoOrientationSupported {
                 connection.videoOrientation = orientation
+            }
+
+            if let connection = self?.previewLayer?.connection, connection.isVideoMirroringSupported {
+                connection.automaticallyAdjustsVideoMirroring = false
+                connection.isVideoMirrored = false
             }
         }
     }
@@ -309,6 +424,11 @@ public class BrowserCameraView: UIView {
         guard let config = streamConfig else { return }
         
         streamService?.configure(config: config)
+
+        if let audioEnabled = config["audioEnabled"] as? Bool {
+            isAudioMuted = !audioEnabled
+            streamService?.setMuted(!audioEnabled)
+        }
         
         // Update compositor output size if specified
         if let width = config["width"] as? Int, let height = config["height"] as? Int {
@@ -333,6 +453,7 @@ public class BrowserCameraView: UIView {
     public override func layoutSubviews() {
         super.layoutSubviews()
         previewLayer?.frame = bounds
+        applyPreviewOrientation()
         syncVisualWebViews()
     }
 
@@ -347,17 +468,32 @@ public class BrowserCameraView: UIView {
             let parentWidth = self.bounds.width
             let parentHeight = self.bounds.height
             let rects = self.webOverlayService?.overlayRects ?? []
+            let viewportSizes = self.webOverlayService?.overlayViewportSizes ?? []
             let webViews = self.webOverlayService?.webViews ?? []
 
             for (index, webView) in webViews.enumerated() {
                 let rect = index < rects.count ? rects[index] : CGRect(x: 0, y: 0, width: 1, height: 1)
-                let frame = CGRect(
+                let displayFrame = CGRect(
                     x: rect.origin.x * parentWidth,
                     y: rect.origin.y * parentHeight,
                     width: rect.size.width * parentWidth,
                     height: rect.size.height * parentHeight
                 )
-                webView.frame = frame
+                let viewportSize = index < viewportSizes.count ? viewportSizes[index] : nil
+                let browserWidth = max(viewportSize?.width ?? displayFrame.width, 1)
+                let browserHeight = max(viewportSize?.height ?? displayFrame.height, 1)
+                let scaleX = displayFrame.width / browserWidth
+                let scaleY = displayFrame.height / browserHeight
+
+                webView.transform = .identity
+                webView.layer.anchorPoint = CGPoint(x: 0, y: 0)
+                webView.frame = CGRect(
+                    x: displayFrame.origin.x,
+                    y: displayFrame.origin.y,
+                    width: browserWidth,
+                    height: browserHeight
+                )
+                webView.transform = CGAffineTransform(scaleX: scaleX, y: scaleY)
                 webView.autoresizingMask = []
                 container.addSubview(webView)
             }
@@ -477,9 +613,29 @@ public class BrowserCameraView: UIView {
     @objc public func switchCamera() {
         cameraService?.switchCamera()
     }
+
+    /// Focus camera/exposure at a view-space point from React Native.
+    @objc public func focusAtPoint(_ x: NSNumber, y: NSNumber) {
+        let rawPoint = CGPoint(x: CGFloat(truncating: x), y: CGFloat(truncating: y))
+        let devicePoint: CGPoint
+
+        if rawPoint.x >= 0, rawPoint.x <= 1, rawPoint.y >= 0, rawPoint.y <= 1 {
+            devicePoint = rawPoint
+        } else if let previewLayer = previewLayer {
+            devicePoint = previewLayer.captureDevicePointConverted(fromLayerPoint: rawPoint)
+        } else {
+            let safeWidth = max(bounds.width, 1)
+            let safeHeight = max(bounds.height, 1)
+            devicePoint = CGPoint(x: rawPoint.x / safeWidth, y: rawPoint.y / safeHeight)
+        }
+
+        let autoFocusEnabled = cameraConfig?["autoFocusEnabled"] as? Bool ?? true
+        cameraService?.focus(at: devicePoint, lockAfterFocus: !autoFocusEnabled)
+    }
     
     /// Mute/unmute audio
     @objc public func setMuted(_ muted: Bool) {
+        isAudioMuted = muted
         streamService?.setMuted(muted)
     }
     
@@ -523,7 +679,13 @@ public class BrowserCameraView: UIView {
         
         print("[BrowserCameraView] Starting local recording to \(outputPath)")
         streamService?.startRecording(to: outputURL)
-        isRecording = true
+        if streamService?.isRecording == true {
+            isRecording = true
+            sendRecordingStateEvent("recording", path: outputPath)
+        } else {
+            sendRecordingStateEvent("error")
+            sendErrorEvent("Unable to start recording.", code: "RECORDING_FAILED")
+        }
     }
     
     @objc public func stopRecording() -> String {
@@ -531,6 +693,7 @@ public class BrowserCameraView: UIView {
         
         print("[BrowserCameraView] Stopping local recording")
         isRecording = false
+        sendRecordingStateEvent("processing")
         
         // Only stop compositor and capture if we aren't also streaming
         let sState = streamService?.state ?? .idle
@@ -540,18 +703,22 @@ public class BrowserCameraView: UIView {
         }
         
         guard let url = streamService?.stopRecording() else {
+            sendRecordingStateEvent("error")
+            sendErrorEvent("Unable to finish recording.", code: "RECORDING_FAILED")
             return ""
         }
         
         // Save to Photos
         saveToPhotos(url: url)
+        sendRecordingStateEvent("idle", path: url.path)
+        sendRecordingFinishedEvent(url.path)
         
         return url.path
     }
     
     private func saveToPhotos(url: URL) {
         PHPhotoLibrary.requestAuthorization { status in
-            if status == .authorized {
+            if status == .authorized || status == .limited {
                 PHPhotoLibrary.shared().performChanges({
                     PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
                 }) { success, error in
@@ -576,9 +743,127 @@ public class BrowserCameraView: UIView {
     private func sendStreamStatsEvent(_ stats: [String: Any]) {
         onStreamStats?(stats)
     }
+
+    private func sendAudioLevelEvent(level: Float, decibels: Float) {
+        let now = CACurrentMediaTime()
+        guard now - lastAudioLevelEmitTime >= 0.1 else { return }
+
+        lastAudioLevelEmitTime = now
+        let normalizedLevel = max(0, min(1, level))
+        let displayDecibels = max(-60, min(0, decibels))
+        onAudioLevel?([
+            "active": normalizedLevel > 0.02,
+            "level": isAudioMuted ? 0.0 : normalizedLevel,
+            "decibels": isAudioMuted ? -60.0 : displayDecibels
+        ])
+    }
+
+    private func audioLevelMetrics(for sampleBuffer: CMSampleBuffer) -> (level: Float, decibels: Float) {
+        guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let streamDescription = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription) else {
+            return (0, -60)
+        }
+
+        let asbd = streamDescription.pointee
+        let isFloat = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+        let bitsPerChannel = Int(asbd.mBitsPerChannel)
+        var neededSize = 0
+
+        var status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: &neededSize,
+            bufferListOut: nil,
+            bufferListSize: 0,
+            blockBufferAllocator: kCFAllocatorDefault,
+            blockBufferMemoryAllocator: kCFAllocatorDefault,
+            flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+            blockBufferOut: nil
+        )
+
+        guard status == noErr, neededSize > 0 else {
+            return (0, -60)
+        }
+
+        var blockBuffer: CMBlockBuffer?
+        var storage = [UInt8](repeating: 0, count: neededSize)
+        var sumSquares: Float = 0
+        var sampleCount = 0
+
+        storage.withUnsafeMutableBytes { rawBuffer in
+            guard let bufferListPointer = rawBuffer.bindMemory(to: AudioBufferList.self).baseAddress else {
+                return
+            }
+
+            status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+                sampleBuffer,
+                bufferListSizeNeededOut: nil,
+                bufferListOut: bufferListPointer,
+                bufferListSize: neededSize,
+                blockBufferAllocator: kCFAllocatorDefault,
+                blockBufferMemoryAllocator: kCFAllocatorDefault,
+                flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+                blockBufferOut: &blockBuffer
+            )
+
+            guard status == noErr else { return }
+
+            for audioBuffer in UnsafeMutableAudioBufferListPointer(bufferListPointer) {
+                guard let data = audioBuffer.mData else { continue }
+                let byteCount = Int(audioBuffer.mDataByteSize)
+
+                if isFloat && bitsPerChannel == 32 {
+                    let count = byteCount / MemoryLayout<Float>.size
+                    let samples = data.assumingMemoryBound(to: Float.self)
+                    for index in 0..<count {
+                        let sample = samples[index]
+                        sumSquares += sample * sample
+                    }
+                    sampleCount += count
+                } else if bitsPerChannel == 16 {
+                    let count = byteCount / MemoryLayout<Int16>.size
+                    let samples = data.assumingMemoryBound(to: Int16.self)
+                    for index in 0..<count {
+                        let sample = Float(samples[index]) / Float(Int16.max)
+                        sumSquares += sample * sample
+                    }
+                    sampleCount += count
+                } else if bitsPerChannel == 32 {
+                    let count = byteCount / MemoryLayout<Int32>.size
+                    let samples = data.assumingMemoryBound(to: Int32.self)
+                    for index in 0..<count {
+                        let sample = Float(samples[index]) / Float(Int32.max)
+                        sumSquares += sample * sample
+                    }
+                    sampleCount += count
+                }
+            }
+        }
+
+        guard status == noErr, sampleCount > 0 else {
+            return (0, -60)
+        }
+
+        let rms = sqrt(sumSquares / Float(sampleCount))
+        let decibels = max(-60, min(0, 20 * log10(max(rms, 0.000_001))))
+        let level = max(0, min(1, (decibels + 60) / 60))
+
+        return (level, decibels)
+    }
     
-    private func sendErrorEvent(_ message: String) {
-        onError?(["message": message, "code": "STREAMING_ERROR"])
+    private func sendErrorEvent(_ message: String, code: String = "STREAMING_ERROR") {
+        onError?(["message": message, "code": code])
+    }
+
+    private func sendRecordingStateEvent(_ state: String, path: String? = nil) {
+        var payload: [String: Any] = ["state": state]
+        if let path = path {
+            payload["path"] = path
+        }
+        onRecordingStateChange?(payload)
+    }
+
+    private func sendRecordingFinishedEvent(_ path: String) {
+        onRecordingFinished?(["path": path])
     }
 }
 
@@ -638,6 +923,9 @@ extension BrowserCameraView: CameraServiceDelegate {
     }
     
     func cameraService(_ service: CameraService, didOutputAudio sampleBuffer: CMSampleBuffer) {
+        let metrics = audioLevelMetrics(for: sampleBuffer)
+        sendAudioLevelEvent(level: metrics.level, decibels: metrics.decibels)
+
         guard let service = streamService else { return }
         
         // Forward audio buffers directly to stream

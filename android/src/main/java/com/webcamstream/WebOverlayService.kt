@@ -33,6 +33,8 @@ class WebOverlayService(private val context: Context) {
     private var webViewHost: FrameLayout? = null
     private var overlayView: OverlayCanvasView? = null
     private val webViews = linkedMapOf<String, WebView>()
+    private val requestedUrls = mutableMapOf<String, String>()
+    private val appliedZooms = mutableMapOf<String, Float>()
     private var overlays = emptyList<OverlayConfig>()
     private var primaryUrl: String? = null
 
@@ -123,6 +125,10 @@ class WebOverlayService(private val context: Context) {
         overlayView?.invalidate()
     }
 
+    fun hasActiveOverlays(): Boolean {
+        return overlays.any { it.url.isNotBlank() }
+    }
+
     fun updateConfig(config: Map<String, Any?>) {
         isTransparent = (config["transparent"] as? Boolean) ?: isTransparent
         updateThrottleMs = (config["updateThrottleMs"] as? Number)?.toInt() ?: updateThrottleMs
@@ -136,6 +142,8 @@ class WebOverlayService(private val context: Context) {
                 (webView.parent as? ViewGroup)?.removeView(webView)
                 webView.destroy()
             }
+            requestedUrls.remove(id)
+            appliedZooms.remove(id)
         }
 
         overlays.forEachIndexed { index, overlay ->
@@ -145,9 +153,14 @@ class WebOverlayService(private val context: Context) {
             applyTransparency(webView, overlay.transparent)
 
             val normalizedUrl = normalizeUrl(overlay.url)
-            if (webView.url != normalizedUrl) {
+            if (requestedUrls[overlay.id] != normalizedUrl) {
+                requestedUrls[overlay.id] = normalizedUrl
+                appliedZooms.remove(overlay.id)
                 webView.postDelayed({
-                    if (webViews[overlay.id] === webView && webView.url != normalizedUrl) {
+                    if (
+                        webViews[overlay.id] === webView
+                        && requestedUrls[overlay.id] == normalizedUrl
+                    ) {
                         Log.d(TAG, "Loading overlay ${overlay.id}: $normalizedUrl")
                         webView.loadUrl(normalizedUrl)
                     }
@@ -197,15 +210,16 @@ class WebOverlayService(private val context: Context) {
             settings.useWideViewPort = true
             settings.mediaPlaybackRequiresUserGesture = false
             settings.cacheMode = WebSettings.LOAD_DEFAULT
+            setInitialScale(100)
             overScrollMode = View.OVER_SCROLL_NEVER
             isVerticalScrollBarEnabled = false
             isHorizontalScrollBarEnabled = false
             applyTransparency(this, isTransparent)
-            
+
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                 WebView.enableSlowWholeDocumentDraw()
             }
-            
+
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
                 WebView.setWebContentsDebuggingEnabled(true)
             }
@@ -219,6 +233,15 @@ class WebOverlayService(private val context: Context) {
 
                 override fun onPageFinished(view: WebView?, url: String?) {
                     isReady = true
+                    if (view != null) {
+                        val overlayId = webViews.entries.firstOrNull { it.value === view }?.key
+                        val zoom = overlayId?.let { id ->
+                            appliedZooms[id] ?: overlays.firstOrNull { it.id == id }?.zoom
+                        }
+                        if (overlayId != null && zoom != null) {
+                            applyDocumentZoom(overlayId, view, zoom)
+                        }
+                    }
                     onLoadFinish?.invoke()
                     overlayView?.scheduleNextFrame()
                 }
@@ -271,6 +294,8 @@ class WebOverlayService(private val context: Context) {
             view.destroy()
         }
         webViews.clear()
+        requestedUrls.clear()
+        appliedZooms.clear()
         webViewHost?.removeAllViews()
     }
 
@@ -335,11 +360,36 @@ class WebOverlayService(private val context: Context) {
                     View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY)
                 )
                 webView.layout(0, 0, width, height)
-                webView.setInitialScale((overlay.zoom * 100f).roundToInt())
+                val nextZoom = overlay.zoom.coerceIn(0.35f, 3f)
+                val previousZoom = appliedZooms[overlay.id]
+                if (previousZoom == null || kotlin.math.abs(previousZoom - nextZoom) > 0.001f) {
+                    applyDocumentZoom(overlay.id, webView, nextZoom)
+                }
+                appliedZooms[overlay.id] = nextZoom
             }
         }
 
         overlayView?.setContent(overlays, webViews, updateThrottleMs)
+    }
+
+    private fun applyDocumentZoom(overlayId: String, webView: WebView, zoom: Float) {
+        val safeZoom = zoom.coerceIn(0.35f, 3f)
+        webView.evaluateJavascript(
+            """
+            (function () {
+              var root = document.documentElement;
+              if (!root) return false;
+              root.style.zoom = '1';
+              root.style.transform = 'scale(${safeZoom})';
+              root.style.transformOrigin = '0 0';
+              window.scrollTo(0, 0);
+              return true;
+            })();
+            """.trimIndent()
+        ) {
+            overlayView?.scheduleNextFrame()
+            Log.d(TAG, "Applied ${safeZoom}x zoom to overlay $overlayId")
+        }
     }
 
     private fun resolveSize(value: Float, base: Int): Int {

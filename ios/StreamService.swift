@@ -8,6 +8,7 @@
 import Foundation
 import AVFoundation
 import HaishinKit
+import Network
 import VideoToolbox
 
 /// Service for RTMP streaming
@@ -117,15 +118,28 @@ class StreamService: NSObject {
     
     /// Dedicated task to sequentially process frames and feed them to the encoder
     private var frameProcessingTask: Task<Void, Never>?
+
+    /// Whether the user still intends the RTMP stream to be live.
+    private var shouldMaintainConnection: Bool = false
+
+    /// Network route monitor used to recover from Wi-Fi changes and disconnects.
+    private let networkMonitor = NWPathMonitor()
+    private let networkMonitorQueue = DispatchQueue(label: "com.webcamstream.network.monitor")
+    private var networkPathSatisfied: Bool = true
+    private var networkPathSignature: String?
+    private var reconnectWorkItem: DispatchWorkItem?
+    private var reconnectAttempts: Int = 0
     
     // MARK: - Initialization
     
     override init() {
         super.init()
+        startNetworkMonitoring()
         print("[StreamService] Initialized")
     }
     
     deinit {
+        networkMonitor.cancel()
         disconnect()
     }
     
@@ -176,7 +190,17 @@ class StreamService: NSObject {
     }
     
     /// Connect to RTMP server and start streaming
-    func connect() {
+    func connect(reconnect: Bool = false) {
+        if state == .streaming || (!reconnect && state == .connecting) {
+            return
+        }
+
+        shouldMaintainConnection = true
+        cancelReconnect()
+        if !reconnect {
+            reconnectAttempts = 0
+        }
+
         guard let url = rtmpUrl else {
             print("[StreamService] No RTMP URL configured")
             let error = NSError(domain: "StreamService", code: -1, userInfo: [NSLocalizedDescriptionKey: "No RTMP URL configured"])
@@ -188,6 +212,15 @@ class StreamService: NSObject {
             print("[StreamService] ❌ No stream key parsed from URL")
             let error = NSError(domain: "StreamService", code: -1, userInfo: [NSLocalizedDescriptionKey: "No stream key found in URL"])
             delegate?.streamService(self, didFailWithError: error)
+            return
+        }
+
+        guard networkPathSatisfied else {
+            let msg = "[StreamService] Network unavailable; waiting to reconnect..."
+            print(msg)
+            delegate?.streamService(self, didLog: msg)
+            state = .disconnected
+            delegate?.streamService(self, didChangeState: state)
             return
         }
         
@@ -236,6 +269,12 @@ class StreamService: NSObject {
                         print(msg)
                         await MainActor.run {
                             self.delegate?.streamService(self, didLog: msg)
+                        }
+
+                        if self.isRecoverableRTMPStatus(status.code) {
+                            await MainActor.run {
+                                self.handleConnectionInterrupted(reason: status.code)
+                            }
                         }
                     }
                 }
@@ -343,6 +382,9 @@ class StreamService: NSObject {
                     self.state = .error
                     self.delegate?.streamService(self, didFailWithError: error)
                     self.delegate?.streamService(self, didChangeState: .error)
+                    if self.shouldMaintainConnection, self.reconnectAttempts > 0 {
+                        self.scheduleReconnect(reason: "Connect failed")
+                    }
                 }
             }
         }
@@ -351,38 +393,11 @@ class StreamService: NSObject {
     /// Disconnect from RTMP server
     func disconnect() {
         print("[StreamService] Disconnecting...")
-        
-        stopStatsTimer()
-        statusTask?.cancel()
-        statusTask = nil
-        
-        frameContinuation?.finish()
-        frameContinuation = nil
-        frameProcessingTask?.cancel()
-        frameProcessingTask = nil
-        
-        let connection = rtmpConnection
-        let stream = rtmpStream
-        let mixer = mediaMixer
-        
-        rtmpStream = nil
-        rtmpConnection = nil
-        mediaMixer = nil
-        
-        Task {
-            if let mixer = mixer, let stream = stream {
-                await mixer.removeOutput(stream)
-                await mixer.stopRunning()
-            } else if let mixer = mixer {
-                await mixer.stopRunning()
-            }
-            if let stream = stream {
-                _ = try? await stream.close()
-            }
-            if let connection = connection {
-                try? await connection.close()
-            }
-        }
+
+        shouldMaintainConnection = false
+        reconnectAttempts = 0
+        cancelReconnect()
+        tearDownStreamingResources()
         
         state = .disconnected
         streamStartTime = nil
@@ -524,6 +539,8 @@ class StreamService: NSObject {
     /// Stop publishing stream
     func stopPublishing() {
         print("[StreamService] Stop publishing...")
+        shouldMaintainConnection = false
+        cancelReconnect()
         let stream = rtmpStream
         Task {
             _ = try? await stream?.close()
@@ -650,6 +667,136 @@ class StreamService: NSObject {
     }
     
     // MARK: - Private Methods
+
+    private func startNetworkMonitoring() {
+        networkMonitor.pathUpdateHandler = { [weak self] path in
+            guard let self = self else { return }
+
+            let signature = self.networkSignature(for: path)
+            let previousSignature = self.networkPathSignature
+            let routeChanged = previousSignature != nil && previousSignature != signature
+            self.networkPathSignature = signature
+            self.networkPathSatisfied = path.status == .satisfied
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, self.shouldMaintainConnection else { return }
+
+                if path.status != .satisfied {
+                    self.handleConnectionInterrupted(reason: "Network unavailable")
+                    return
+                }
+
+                if routeChanged && (self.state == .streaming || self.state == .connecting) {
+                    self.handleConnectionInterrupted(reason: "Network route changed")
+                } else if self.state == .disconnected || self.state == .error {
+                    self.scheduleReconnect(reason: "Network available")
+                }
+            }
+        }
+        networkMonitor.start(queue: networkMonitorQueue)
+    }
+
+    private func networkSignature(for path: NWPath) -> String {
+        var interfaces: [String] = []
+        if path.usesInterfaceType(.wifi) {
+            interfaces.append("wifi")
+        }
+        if path.usesInterfaceType(.cellular) {
+            interfaces.append("cellular")
+        }
+        if path.usesInterfaceType(.wiredEthernet) {
+            interfaces.append("wired")
+        }
+        if path.usesInterfaceType(.loopback) {
+            interfaces.append("loopback")
+        }
+        if path.usesInterfaceType(.other) {
+            interfaces.append("other")
+        }
+        return "\(path.status)-\(interfaces.joined(separator: ","))"
+    }
+
+    private func isRecoverableRTMPStatus(_ code: String) -> Bool {
+        return code == RTMPConnection.Code.connectClosed.rawValue
+            || code == RTMPConnection.Code.connectFailed.rawValue
+    }
+
+    private func handleConnectionInterrupted(reason: String) {
+        guard shouldMaintainConnection else { return }
+        guard state == .streaming || state == .connecting else { return }
+
+        let msg = "[StreamService] Network interruption detected (\(reason)); reconnecting..."
+        print(msg)
+        delegate?.streamService(self, didLog: msg)
+
+        tearDownStreamingResources()
+        state = .disconnected
+        delegate?.streamService(self, didChangeState: state)
+        scheduleReconnect(reason: reason)
+    }
+
+    private func scheduleReconnect(reason: String) {
+        guard shouldMaintainConnection, networkPathSatisfied else { return }
+        guard reconnectWorkItem == nil else { return }
+        guard state != .streaming && state != .connecting else { return }
+
+        reconnectAttempts += 1
+        let delay = min(pow(2.0, Double(max(0, reconnectAttempts - 1))), 10.0)
+        let msg = "[StreamService] Scheduling RTMP reconnect attempt \(reconnectAttempts) in \(String(format: "%.1f", delay))s (\(reason))"
+        print(msg)
+        delegate?.streamService(self, didLog: msg)
+        state = .connecting
+        delegate?.streamService(self, didChangeState: state)
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.reconnectWorkItem = nil
+            guard self.shouldMaintainConnection else { return }
+            self.connect(reconnect: true)
+        }
+
+        reconnectWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func cancelReconnect() {
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
+    }
+
+    private func tearDownStreamingResources() {
+        stopStatsTimer()
+        statusTask?.cancel()
+        statusTask = nil
+
+        frameContinuation?.finish()
+        frameContinuation = nil
+        frameProcessingTask?.cancel()
+        frameProcessingTask = nil
+
+        let connection = rtmpConnection
+        let stream = rtmpStream
+        let mixer = mediaMixer
+
+        rtmpStream = nil
+        rtmpConnection = nil
+        mediaMixer = nil
+
+        Task {
+            if let mixer = mixer, let stream = stream {
+                await mixer.removeOutput(stream)
+                await mixer.stopRunning()
+            } else if let mixer = mixer {
+                await mixer.stopRunning()
+            }
+            if let stream = stream {
+                _ = try? await stream.close()
+            }
+            if let connection = connection {
+                try? await connection.close()
+            }
+        }
+    }
     
     /// Parse RTMP URL into server URL and stream key
     private func parseRtmpUrl(_ url: String) {

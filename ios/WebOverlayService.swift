@@ -20,11 +20,19 @@ private final class OverlayWebViewState {
     let webView: WKWebView
     var currentUrl: URL?
     var rect: CGRect
+    var viewportSize: CGSize?
+    var zoom: CGFloat = 1.0
     var snapshot: UIImage?
+    var pendingZoomApplications: [DispatchWorkItem] = []
 
     init(webView: WKWebView, rect: CGRect) {
         self.webView = webView
         self.rect = rect
+    }
+
+    func cancelPendingZoomApplications() {
+        pendingZoomApplications.forEach { $0.cancel() }
+        pendingZoomApplications.removeAll()
     }
 }
 
@@ -46,6 +54,11 @@ class WebOverlayService: NSObject {
     /// Relative overlay layouts (0...1 space)
     var overlayRects: [CGRect] {
         overlayStates.map(\.rect)
+    }
+
+    /// Optional browser viewport sizes before each overlay is scaled into its rect.
+    var overlayViewportSizes: [CGSize?] {
+        overlayStates.map(\.viewportSize)
     }
 
     /// Update throttle interval in milliseconds
@@ -213,6 +226,12 @@ class WebOverlayService: NSObject {
 
         let overlayConfigs = parseOverlayConfigs(from: config)
         let frame = webView?.superview?.bounds ?? webView?.frame ?? .zero
+
+        if config["overlays"] != nil && overlayConfigs.isEmpty {
+            ensureOverlayCount(0, frame: frame)
+            return
+        }
+
         ensureOverlayCount(max(overlayConfigs.count, 1), frame: frame)
 
         for (index, overlayConfig) in overlayConfigs.enumerated() {
@@ -227,12 +246,16 @@ class WebOverlayService: NSObject {
     // MARK: - Private Methods
 
     private func ensureOverlayCount(_ count: Int, frame: CGRect) {
-        let safeCount = max(1, count)
+        let safeCount = max(0, count)
 
         if overlayStates.count > safeCount {
             let removed = Array(overlayStates.suffix(overlayStates.count - safeCount))
             overlayStates.removeLast(overlayStates.count - safeCount)
-            removed.forEach { $0.webView.removeFromSuperview() }
+            removed.forEach {
+                $0.cancelPendingZoomApplications()
+                $0.webView.stopLoading()
+                $0.webView.removeFromSuperview()
+            }
         }
 
         while overlayStates.count < safeCount {
@@ -259,6 +282,9 @@ class WebOverlayService: NSObject {
         webView.backgroundColor = isTransparent ? .clear : .white
         webView.scrollView.backgroundColor = isTransparent ? .clear : .white
         webView.scrollView.isScrollEnabled = false
+        if #available(iOS 11.0, *) {
+            webView.scrollView.contentInsetAdjustmentBehavior = .never
+        }
         webView.isUserInteractionEnabled = false
         webView.clipsToBounds = true
 
@@ -294,6 +320,14 @@ class WebOverlayService: NSObject {
         let height = (config["height"] as? NSNumber)?.doubleValue ?? 1
         state.rect = CGRect(x: x, y: y, width: width, height: height)
 
+        let viewportWidth = (config["viewportWidth"] as? NSNumber)?.doubleValue
+        let viewportHeight = (config["viewportHeight"] as? NSNumber)?.doubleValue
+        if let viewportWidth, let viewportHeight, viewportWidth > 0, viewportHeight > 0 {
+            state.viewportSize = CGSize(width: viewportWidth, height: viewportHeight)
+        } else {
+            state.viewportSize = nil
+        }
+
         if let transparent = config["transparent"] as? Bool {
             state.webView.isOpaque = !transparent
             state.webView.backgroundColor = transparent ? .clear : .white
@@ -309,9 +343,8 @@ class WebOverlayService: NSObject {
         }
 
         if let zoom = (config["zoom"] as? NSNumber)?.doubleValue {
-            DispatchQueue.main.async {
-                state.webView.pageZoom = CGFloat(zoom)
-            }
+            state.zoom = CGFloat(max(0.1, min(5.0, zoom)))
+            applyZoom(to: state, scheduleFollowUps: false)
         }
 
         if let injectedJS = config["injectedJavaScript"] as? String {
@@ -335,6 +368,24 @@ class WebOverlayService: NSObject {
         print("[WebOverlayService] Loading URL: \(urlString)")
         state.webView.load(URLRequest(url: url))
         delegate?.webOverlayServiceDidStartLoad(self)
+    }
+
+    private func applyZoom(to state: OverlayWebViewState, scheduleFollowUps: Bool) {
+        let apply = { [weak state] in
+            guard let state = state else { return }
+            state.webView.pageZoom = state.zoom
+        }
+
+        state.cancelPendingZoomApplications()
+        apply()
+
+        guard scheduleFollowUps else { return }
+
+        [0.05, 0.15, 0.35].forEach { delay in
+            let item = DispatchWorkItem(block: apply)
+            state.pendingZoomApplications.append(item)
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+        }
     }
 
     private func performSnapshots() {
@@ -363,6 +414,9 @@ extension WebOverlayService: WKNavigationDelegate {
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         print("[WebOverlayService] Page loaded")
+        if let state = overlayStates.first(where: { $0.webView === webView }) {
+            applyZoom(to: state, scheduleFollowUps: true)
+        }
         delegate?.webOverlayServiceDidFinishLoad(self)
     }
 

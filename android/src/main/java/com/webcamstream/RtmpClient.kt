@@ -2,17 +2,20 @@ package com.webcamstream
 
 import android.Manifest
 import android.app.Activity
+import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Rect
+import android.media.MediaScannerConnection
 import android.os.Build
 import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.provider.MediaStore
 import android.util.Log
 import android.view.PixelCopy
 import android.view.View
@@ -65,6 +68,7 @@ class RtmpClient(
     var onStateChange: ((StreamState) -> Unit)? = null
     var onStatsUpdate: ((StreamStats) -> Unit)? = null
     var onError: ((String) -> Unit)? = null
+    var onAudioLevel: ((level: Double, decibels: Double) -> Unit)? = null
 
     fun configure(config: Map<String, Any?>) {
         rtmpUrl = config["url"] as? String
@@ -86,6 +90,25 @@ class RtmpClient(
         if (url.isNullOrBlank()) {
             fail("Missing RTMP URL")
             return
+        }
+
+        if (state == StreamState.STREAMING) {
+            return
+        }
+
+        // RootEncoder keeps isStreaming=true when the socket fails. Tear down the
+        // stale publisher before preparing a reconnect attempt.
+        val staleStream = rtmpStream
+        if (staleStream?.isStreaming == true) {
+            try {
+                staleStream.stopStream()
+            } catch (error: Exception) {
+                Log.w(TAG, "Failed to reset stale RTMP publisher", error)
+            }
+            stopCaptureLoop()
+            preparedKey = null
+            rtmpStream = null
+            videoSource = null
         }
 
         try {
@@ -138,11 +161,13 @@ class RtmpClient(
         val recHeight = (recordingConfig?.get("height") as? Number)?.toInt() ?: config.height
         val recBitrate = (recordingConfig?.get("bitrate") as? Number)?.toInt() ?: config.bitrate
         val audioEnabled = (recordingConfig?.get("audioEnabled") as? Boolean) ?: false
+        val recAudioBitrate = (recordingConfig?.get("audioBitrate") as? Number)?.toInt() ?: config.audioBitrate
+        val recAudioSampleRate = (recordingConfig?.get("audioSampleRate") as? Number)?.toInt() ?: config.audioSampleRate
 
         var outputPath = (recordingConfig?.get("outputPath") as? String)
             ?.takeIf { it.isNotBlank() }
             ?: createRecordingPath()
-            
+
         if (outputPath.startsWith("file://")) {
             outputPath = outputPath.substring(7)
         }
@@ -152,10 +177,6 @@ class RtmpClient(
             localRecorder?.stop()
             localRecorder = null
 
-            if (audioEnabled) {
-                Log.w(TAG, "Local recording currently captures video only; audioEnabled is ignored")
-            }
-
             Log.d(TAG, "Starting LOCAL recording to: $outputPath (${recWidth}x${recHeight} @ ${recBitrate}bps)")
             lastRecordingPath = outputPath
 
@@ -164,7 +185,11 @@ class RtmpClient(
                 width = recWidth,
                 height = recHeight,
                 fps = config.fps,
-                bitrate = recBitrate
+                bitrate = recBitrate,
+                audioEnabled = audioEnabled,
+                audioBitrate = recAudioBitrate,
+                audioSampleRate = recAudioSampleRate,
+                onAudioLevel = onAudioLevel
             )
             recorder.start(outputPath)
             localRecorder = recorder
@@ -188,17 +213,13 @@ class RtmpClient(
             Log.w(TAG, "Failed to stop recording cleanly", error)
             throw IllegalStateException("Failed to stop recording: ${error.message}", error)
         }
-        
+
+        var galleryLocation: String? = null
         if (lastRecordingPath.isNotBlank()) {
-            android.media.MediaScannerConnection.scanFile(
-                context,
-                arrayOf(lastRecordingPath),
-                arrayOf("video/mp4"),
-                null
-            )
+            galleryLocation = saveRecordingToGallery(lastRecordingPath)
         }
-        
-        Log.d(TAG, "Recording stopped: $lastRecordingPath")
+
+        Log.d(TAG, "Recording stopped: $lastRecordingPath, gallery=$galleryLocation")
         return lastRecordingPath
     }
 
@@ -275,7 +296,7 @@ class RtmpClient(
         }
 
         val source = BufferVideoSource(BufferVideoSource.Format.ARGB, nextConfig.bitrate)
-        
+
         var useAudio = nextConfig.audioEnabled
         if (useAudio) {
             val hasMicPermission = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
@@ -300,6 +321,11 @@ class RtmpClient(
             throw IllegalStateException("RootEncoder prepare failed (video=$videoPrepared)")
         }
 
+        // BufferVideoSource receives a fully composed landscape bitmap. RootEncoder's
+        // rotation=0 setup defaults its GL texture orientation to 270 degrees for raw
+        // camera sources, so explicitly restore zero rotation for this precomposed view.
+        stream.setOrientation(0)
+
         if (useAudio) {
             val audioPrepared = try {
                 stream.prepareAudio(
@@ -311,7 +337,7 @@ class RtmpClient(
                 Log.e(TAG, "Failed to prepare audio, falling back to NoAudioSource", e)
                 false
             }
-            
+
             if (!audioPrepared) {
                 Log.w(TAG, "Audio preparation failed, re-preparing without audio")
                 // Recursively call with audio disabled for this attempt
@@ -342,11 +368,120 @@ class RtmpClient(
     }
 
     private fun createRecordingPath(): String {
-        @Suppress("DEPRECATION")
-        val directory = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES)
+        val directory = File(context.cacheDir, "openscoreboard-recordings")
         if (!directory.exists()) directory.mkdirs()
         val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
-        return File(directory, "browser-cam-$stamp.mp4").absolutePath
+        return File(directory, "openscoreboard-$stamp.mp4").absolutePath
+    }
+
+    private fun saveRecordingToGallery(path: String): String? {
+        val sourceFile = File(path)
+        if (!sourceFile.exists() || sourceFile.length() <= 0L) {
+            Log.w(TAG, "Recording was not saved to gallery because the source file is missing or empty: $path")
+            return null
+        }
+
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                saveRecordingToMediaStore(sourceFile)
+            } else {
+                saveRecordingToPublicMovies(sourceFile)
+            }
+        } catch (error: Exception) {
+            Log.w(TAG, "Failed to save recording to gallery; scanning source path as fallback", error)
+            MediaScannerConnection.scanFile(
+                context,
+                arrayOf(sourceFile.absolutePath),
+                arrayOf("video/mp4"),
+                null
+            )
+            null
+        }
+    }
+
+    private fun saveRecordingToMediaStore(sourceFile: File): String? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
+
+        val resolver = context.contentResolver
+        val displayName = sourceFile.name.ifBlank {
+            val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
+            "openscoreboard-$stamp.mp4"
+        }
+        val values = ContentValues().apply {
+            put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
+            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+            put(MediaStore.Video.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MOVIES}/OpenScoreboard")
+            put(MediaStore.Video.Media.DATE_ADDED, System.currentTimeMillis() / 1000L)
+            put(MediaStore.Video.Media.DATE_TAKEN, System.currentTimeMillis())
+            put(MediaStore.Video.Media.IS_PENDING, 1)
+        }
+
+        val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+            ?: throw IllegalStateException("Unable to create gallery video entry")
+
+        try {
+            resolver.openOutputStream(uri)?.use { output ->
+                sourceFile.inputStream().use { input -> input.copyTo(output) }
+            } ?: throw IllegalStateException("Unable to open gallery video output stream")
+
+            val publishedValues = ContentValues().apply {
+                put(MediaStore.Video.Media.IS_PENDING, 0)
+            }
+            resolver.update(uri, publishedValues, null, null)
+            return uri.toString()
+        } catch (error: Exception) {
+            resolver.delete(uri, null, null)
+            throw error
+        }
+    }
+
+    private fun saveRecordingToPublicMovies(sourceFile: File): String {
+        @Suppress("DEPRECATION")
+        val directory = File(
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES),
+            "OpenScoreboard"
+        )
+        if (!directory.exists() && !directory.mkdirs()) {
+            throw IllegalStateException("Unable to create gallery recording directory")
+        }
+
+        val destination = uniqueFile(directory, sourceFile.name)
+        sourceFile.inputStream().use { input ->
+            destination.outputStream().use { output -> input.copyTo(output) }
+        }
+        MediaScannerConnection.scanFile(
+            context,
+            arrayOf(destination.absolutePath),
+            arrayOf("video/mp4"),
+            null
+        )
+        return destination.absolutePath
+    }
+
+    private fun uniqueFile(directory: File, fileName: String): File {
+        val fallbackName = if (fileName.isBlank()) {
+            val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
+            "openscoreboard-$stamp.mp4"
+        } else {
+            fileName
+        }
+
+        var candidate = File(directory, fallbackName)
+        if (!candidate.exists()) return candidate
+
+        val baseName = fallbackName.substringBeforeLast(".", fallbackName)
+        val extension = fallbackName.substringAfterLast(".", "")
+        var index = 1
+        while (candidate.exists()) {
+            val nextName = if (extension.isBlank()) {
+                "$baseName-$index"
+            } else {
+                "$baseName-$index.$extension"
+            }
+            candidate = File(directory, nextName)
+            index += 1
+        }
+        return candidate
     }
 
     private fun updateState(newState: StreamState) {
@@ -458,7 +593,9 @@ class RtmpClient(
                 val hardwareView = findViewByTypes(cameraView, listOf("TextureView", "SurfaceView"))
 
                 if (hardwareView is TextureView) {
-                    val camBitmap = hardwareView.bitmap
+                    // PreviewView.bitmap applies CameraX's sensor rotation and FILL_CENTER
+                    // transformation. TextureView.bitmap returns the raw sensor-oriented frame.
+                    val camBitmap = (cameraView as? PreviewView)?.bitmap ?: hardwareView.bitmap
                     if (camBitmap != null) {
                         canvas.drawBitmap(camBitmap, null, android.graphics.Rect(0, 0, width, height), null)
                         cameraCaptured = true
@@ -492,19 +629,19 @@ class RtmpClient(
 
         private fun finalizeFrameOptimized(target: Bitmap, overlayView: View?) {
             if (overlayView == null) return
-            
+
             val canvas = Canvas(target)
-            
+
             // Optimization: Only redraw WebView every 3 frames (~10fps for overlays)
             val shouldRedrawWebView = frameCount % 3 == 0 || lastWebViewBitmap == null
-            
+
             if (shouldRedrawWebView) {
                 val webViewBitmap = lastWebViewBitmap?.takeIf { it.width == target.width && it.height == target.height }
                     ?: Bitmap.createBitmap(target.width, target.height, Bitmap.Config.ARGB_8888).also {
                         lastWebViewBitmap?.recycle()
                         lastWebViewBitmap = it
                     }
-                
+
                 val webCanvas = Canvas(webViewBitmap)
                 webCanvas.drawColor(Color.TRANSPARENT, android.graphics.PorterDuff.Mode.CLEAR)
                 try {
@@ -527,7 +664,7 @@ class RtmpClient(
                 }
             Canvas(output).drawBitmap(source, null, Rect(0, 0, outputWidth, outputHeight), null)
             output.getPixels(pixels, 0, outputWidth, 0, 0, outputWidth, outputHeight)
-            
+
             // Debug: Check if the bitmap is all black
             if (frameCount % 60 == 0) {
                 var allBlack = true
@@ -539,9 +676,9 @@ class RtmpClient(
                 }
                 Log.d("RtmpClient", "Frame $frameCount check: allBlack=$allBlack, pixels[0]=${Integer.toHexString(pixels[0])}")
             }
-            
+
             onFrame(pixels)
-            
+
             frameCount++
         }
 

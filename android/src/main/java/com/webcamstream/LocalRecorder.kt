@@ -1,15 +1,21 @@
 package com.webcamstream
 
+import android.Manifest
+import android.annotation.SuppressLint
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Rect
+import android.media.AudioFormat
+import android.media.AudioRecord
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.MediaMuxer
+import android.media.MediaRecorder
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
@@ -22,10 +28,14 @@ import android.view.SurfaceView
 import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
+import androidx.core.content.ContextCompat
 import java.io.File
+import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.log10
+import kotlin.math.sqrt
 
 /**
  * High-performance local video recorder using MediaCodec + MediaMuxer directly.
@@ -43,24 +53,49 @@ class LocalRecorder(
     private val width: Int = 720,
     private val height: Int = 1280,
     private val fps: Int = 30,
-    private val bitrate: Int = 4_000_000
+    private val bitrate: Int = 4_000_000,
+    private val audioEnabled: Boolean = false,
+    private val audioBitrate: Int = 128_000,
+    private val audioSampleRate: Int = 44_100,
+    private val onAudioLevel: ((level: Double, decibels: Double) -> Unit)? = null
 ) {
     companion object {
         private const val TAG = "LocalRecorder"
-        private const val MIME_TYPE = "video/avc"
+        private const val VIDEO_MIME_TYPE = "video/avc"
+        private const val AUDIO_MIME_TYPE = "audio/mp4a-latm"
+        private const val AUDIO_CHANNEL_COUNT = 1
+        private const val AUDIO_BYTES_PER_SAMPLE = 2
         private const val I_FRAME_INTERVAL = 2
         private const val TIMEOUT_US = 10_000L
         private const val DRAIN_STOP_TIMEOUT_MS = 3_000L
+        private const val MUXER_START_WAIT_MS = 1_500L
+        private const val AUDIO_EOS_MAX_ATTEMPTS = 200
+        private const val AUDIO_LEVEL_INTERVAL_MS = 80L
+        private const val MIN_VALID_AUDIO_LEVEL = 0.000_5
+        private const val MIN_DECIBELS = -60.0
     }
 
     private var encoder: MediaCodec? = null
+    private var audioEncoder: MediaCodec? = null
+    private var audioRecord: AudioRecord? = null
+    private var audioThread: Thread? = null
     private var muxer: MediaMuxer? = null
     private var inputSurface: Surface? = null
     private var videoTrackIndex = -1
+    private var audioTrackIndex = -1
     private val muxerStarted = AtomicBoolean(false)
+    private val muxerLock = Object()
     private val isRecording = AtomicBoolean(false)
     private val stopRequested = AtomicBoolean(false)
     private var drainComplete = CountDownLatch(0)
+    private var expectedTrackCount = 1
+    private var addedTrackCount = 0
+    private var recordAudio = false
+    private var audioInputBufferSize = 0
+    private var audioBytesSubmitted = 0L
+    private var audioInputEosQueued = false
+    private var audioOutputEos = false
+    private var lastAudioLevelEmitMs = 0L
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var drainThread: HandlerThread? = null
@@ -119,10 +154,24 @@ class LocalRecorder(
 
         try {
             stopRequested.set(false)
-            drainComplete = CountDownLatch(1)
+            recordAudio = audioEnabled
+            if (recordAudio && !hasAudioPermission()) {
+                throw IllegalStateException("Microphone permission is required to record audio")
+            }
+
+            expectedTrackCount = if (recordAudio) 2 else 1
+            addedTrackCount = 0
+            videoTrackIndex = -1
+            audioTrackIndex = -1
+            audioInputBufferSize = 0
+            audioBytesSubmitted = 0L
+            audioInputEosQueued = false
+            audioOutputEos = false
+            lastAudioLevelEmitMs = 0L
+            drainComplete = CountDownLatch(expectedTrackCount)
 
             // 1. Configure encoder
-            val format = MediaFormat.createVideoFormat(MIME_TYPE, width, height).apply {
+            val format = MediaFormat.createVideoFormat(VIDEO_MIME_TYPE, width, height).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
                 setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
                 setInteger(MediaFormat.KEY_FRAME_RATE, fps)
@@ -134,16 +183,22 @@ class LocalRecorder(
                 }
             }
 
-            val enc = MediaCodec.createEncoderByType(MIME_TYPE)
+            val enc = MediaCodec.createEncoderByType(VIDEO_MIME_TYPE)
             enc.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             inputSurface = enc.createInputSurface()
             enc.start()
             encoder = enc
             Log.d(TAG, "Encoder started: ${width}x${height} @ ${bitrate}bps, ${fps}fps")
 
+            if (recordAudio) {
+                audioRecord = createAudioRecord()
+                audioEncoder = createAudioEncoder()
+                audioRecord?.startRecording()
+                Log.d(TAG, "Audio encoder started: ${audioSampleRate}Hz @ ${audioBitrate}bps")
+            }
+
             // 2. Create muxer
             muxer = MediaMuxer(path, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-            videoTrackIndex = -1
             muxerStarted.set(false)
 
             // 3. Start drain thread
@@ -164,6 +219,9 @@ class LocalRecorder(
 
             // 5. Start drain loop
             drainHandler?.post { drainLoop() }
+            if (recordAudio) {
+                startAudioLoop()
+            }
 
             // 6. Start capture via Choreographer (vsync-aligned)
             Choreographer.getInstance().postFrameCallback(choreographerCallback)
@@ -195,6 +253,14 @@ class LocalRecorder(
             encoder?.signalEndOfInputStream()
         } catch (e: Exception) {
             Log.w(TAG, "Error signaling EOS", e)
+        }
+
+        if (recordAudio) {
+            try {
+                audioRecord?.stop()
+            } catch (e: Exception) {
+                Log.w(TAG, "Error stopping audio input", e)
+            }
         }
 
         if (!drainComplete.await(DRAIN_STOP_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
@@ -229,6 +295,23 @@ class LocalRecorder(
             Log.w(TAG, "Encoder cleanup error", e)
         }
         encoder = null
+
+        try {
+            audioRecord?.stop()
+        } catch (_: Exception) {
+            // It may already be stopped during normal shutdown.
+        }
+        audioRecord?.release()
+        audioRecord = null
+
+        try {
+            audioEncoder?.stop()
+            audioEncoder?.release()
+        } catch (e: Exception) {
+            Log.w(TAG, "Audio encoder cleanup error", e)
+        }
+        audioEncoder = null
+        audioThread = null
 
         inputSurface?.release()
         inputSurface = null
@@ -400,6 +483,278 @@ class LocalRecorder(
         }
     }
 
+    // ========== AUDIO CAPTURE ==========
+
+    private fun hasAudioPermission(): Boolean {
+        return ContextCompat.checkSelfPermission(
+            sourceView.context,
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun createAudioRecord(): AudioRecord {
+        val minBufferSize = AudioRecord.getMinBufferSize(
+            audioSampleRate,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+        if (minBufferSize <= 0) {
+            throw IllegalStateException("Microphone is unavailable for local recording")
+        }
+
+        audioInputBufferSize = (minBufferSize * 2).coerceAtLeast(audioSampleRate / 5)
+        val recorder = AudioRecord(
+            MediaRecorder.AudioSource.MIC,
+            audioSampleRate,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+            audioInputBufferSize
+        )
+
+        if (recorder.state != AudioRecord.STATE_INITIALIZED) {
+            recorder.release()
+            throw IllegalStateException("Microphone could not be initialized for local recording")
+        }
+
+        return recorder
+    }
+
+    private fun createAudioEncoder(): MediaCodec {
+        val format = MediaFormat.createAudioFormat(
+            AUDIO_MIME_TYPE,
+            audioSampleRate,
+            AUDIO_CHANNEL_COUNT
+        ).apply {
+            setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+            setInteger(MediaFormat.KEY_BIT_RATE, audioBitrate)
+            setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, audioInputBufferSize)
+        }
+
+        return MediaCodec.createEncoderByType(AUDIO_MIME_TYPE).also { codec ->
+            codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            codec.start()
+        }
+    }
+
+    private fun startAudioLoop() {
+        audioThread = Thread({ audioLoop() }, "LocalRecAudio").also { it.start() }
+    }
+
+    private fun audioLoop() {
+        val recorder = audioRecord
+        val codec = audioEncoder
+        if (recorder == null || codec == null) {
+            drainComplete.countDown()
+            return
+        }
+
+        val inputBuffer = ByteArray(audioInputBufferSize)
+
+        try {
+            while (isRecording.get()) {
+                val bytesRead = try {
+                    recorder.read(inputBuffer, 0, inputBuffer.size)
+                } catch (error: Exception) {
+                    Log.w(TAG, "Audio read failed", error)
+                    break
+                }
+
+                if (bytesRead > 0) {
+                    queueAudioInput(inputBuffer, bytesRead)
+                    emitAudioLevel(inputBuffer, bytesRead)
+                }
+
+                drainAudioEncoder(waitForOutput = false)
+            }
+
+            queueAudioEndOfStream()
+            var drainAttempts = 0
+            while (!audioOutputEos && drainAttempts < AUDIO_EOS_MAX_ATTEMPTS) {
+                drainAudioEncoder(waitForOutput = true)
+                drainAttempts += 1
+            }
+            if (!audioOutputEos) {
+                Log.w(TAG, "Audio encoder did not signal EOS before timeout")
+            }
+        } catch (error: Exception) {
+            Log.w(TAG, "Audio loop failed", error)
+        } finally {
+            drainComplete.countDown()
+            Log.d(TAG, "Audio loop ended")
+        }
+    }
+
+    private fun queueAudioInput(buffer: ByteArray, size: Int) {
+        val codec = audioEncoder ?: return
+
+        while (isRecording.get()) {
+            val inputIndex = codec.dequeueInputBuffer(TIMEOUT_US)
+            if (inputIndex >= 0) {
+                val codecBuffer = codec.getInputBuffer(inputIndex) ?: return
+                codecBuffer.clear()
+                codecBuffer.put(buffer, 0, size)
+                val presentationTimeUs = nextAudioPresentationTimeUs(size)
+                codec.queueInputBuffer(inputIndex, 0, size, presentationTimeUs, 0)
+                return
+            }
+
+            drainAudioEncoder(waitForOutput = false)
+        }
+    }
+
+    private fun queueAudioEndOfStream() {
+        if (audioInputEosQueued) return
+        val codec = audioEncoder ?: return
+
+        var attempts = 0
+        while (!audioInputEosQueued && attempts < AUDIO_EOS_MAX_ATTEMPTS) {
+            val inputIndex = codec.dequeueInputBuffer(TIMEOUT_US)
+            if (inputIndex >= 0) {
+                val presentationTimeUs = nextAudioPresentationTimeUs(0)
+                codec.queueInputBuffer(
+                    inputIndex,
+                    0,
+                    0,
+                    presentationTimeUs,
+                    MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                )
+                audioInputEosQueued = true
+            } else {
+                drainAudioEncoder(waitForOutput = false)
+                attempts += 1
+            }
+        }
+        if (!audioInputEosQueued) {
+            Log.w(TAG, "Audio encoder did not accept EOS input before timeout")
+        }
+    }
+
+    private fun drainAudioEncoder(waitForOutput: Boolean) {
+        val codec = audioEncoder ?: return
+        val bufferInfo = MediaCodec.BufferInfo()
+
+        while (true) {
+            val outputIndex = codec.dequeueOutputBuffer(bufferInfo, if (waitForOutput) TIMEOUT_US else 0L)
+            when {
+                outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                    if (audioTrackIndex < 0) {
+                        val newFormat = codec.outputFormat
+                        Log.d(TAG, "Audio output format: $newFormat")
+                        audioTrackIndex = addMuxerTrack(newFormat, "audio")
+                    }
+                }
+
+                outputIndex >= 0 -> {
+                    val outputBuffer = codec.getOutputBuffer(outputIndex)
+
+                    if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+                        bufferInfo.size = 0
+                    }
+
+                    if (outputBuffer != null && bufferInfo.size > 0) {
+                        outputBuffer.position(bufferInfo.offset)
+                        outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
+                        writeEncodedSample(audioTrackIndex, outputBuffer, bufferInfo)
+                    }
+
+                    codec.releaseOutputBuffer(outputIndex, false)
+
+                    if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                        audioOutputEos = true
+                        return
+                    }
+                }
+
+                outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> return
+            }
+        }
+    }
+
+    private fun nextAudioPresentationTimeUs(byteCount: Int): Long {
+        val submittedSamples = audioBytesSubmitted / (AUDIO_BYTES_PER_SAMPLE * AUDIO_CHANNEL_COUNT)
+        val presentationTimeUs = submittedSamples * 1_000_000L / audioSampleRate
+        audioBytesSubmitted += byteCount
+        return presentationTimeUs
+    }
+
+    private fun emitAudioLevel(buffer: ByteArray, size: Int) {
+        val now = System.currentTimeMillis()
+        if (now - lastAudioLevelEmitMs < AUDIO_LEVEL_INTERVAL_MS) return
+        lastAudioLevelEmitMs = now
+
+        var sumSquares = 0.0
+        var sampleCount = 0
+        var index = 0
+        while (index + 1 < size) {
+            val low = buffer[index].toInt() and 0xff
+            val high = buffer[index + 1].toInt()
+            val sample = ((high shl 8) or low).toShort()
+            val normalized = sample / Short.MAX_VALUE.toDouble()
+            sumSquares += normalized * normalized
+            sampleCount += 1
+            index += AUDIO_BYTES_PER_SAMPLE
+        }
+
+        if (sampleCount <= 0) return
+
+        val rms = sqrt(sumSquares / sampleCount)
+        if (rms <= MIN_VALID_AUDIO_LEVEL) return
+
+        val level = rms.coerceIn(0.0, 1.0)
+        val decibels = (20.0 * log10(level)).coerceIn(MIN_DECIBELS, 0.0)
+        onAudioLevel?.invoke(level, decibels)
+    }
+
+    // ========== MUXER COORDINATION ==========
+
+    private fun addMuxerTrack(format: MediaFormat, label: String): Int {
+        synchronized(muxerLock) {
+            val mux = muxer ?: throw IllegalStateException("Muxer is not available")
+            val trackIndex = mux.addTrack(format)
+            addedTrackCount += 1
+
+            if (addedTrackCount >= expectedTrackCount && !muxerStarted.get()) {
+                mux.start()
+                muxerStarted.set(true)
+                muxerLock.notifyAll()
+                Log.d(TAG, "Muxer started with $addedTrackCount tracks")
+            }
+
+            Log.d(TAG, "Added $label track=$trackIndex")
+            return trackIndex
+        }
+    }
+
+    private fun writeEncodedSample(trackIndex: Int, outputBuffer: ByteBuffer, bufferInfo: MediaCodec.BufferInfo) {
+        if (trackIndex < 0) return
+        if (!waitForMuxerStarted()) {
+            Log.w(TAG, "Dropping encoded sample because muxer did not start")
+            return
+        }
+
+        synchronized(muxerLock) {
+            if (muxerStarted.get()) {
+                muxer?.writeSampleData(trackIndex, outputBuffer, bufferInfo)
+            }
+        }
+    }
+
+    private fun waitForMuxerStarted(): Boolean {
+        if (muxerStarted.get()) return true
+
+        synchronized(muxerLock) {
+            if (!muxerStarted.get()) {
+                try {
+                    muxerLock.wait(MUXER_START_WAIT_MS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
+            return muxerStarted.get()
+        }
+    }
+
     // ========== ENCODER DRAIN ==========
 
     private fun drainLoop() {
@@ -420,11 +775,9 @@ class LocalRecorder(
                     outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                         val newFormat = enc.outputFormat
                         Log.d(TAG, "Encoder output format: $newFormat")
-                        val mux = muxer ?: break
-                        videoTrackIndex = mux.addTrack(newFormat)
-                        mux.start()
-                        muxerStarted.set(true)
-                        Log.d(TAG, "Muxer started, track=$videoTrackIndex")
+                        if (videoTrackIndex < 0) {
+                            videoTrackIndex = addMuxerTrack(newFormat, "video")
+                        }
                     }
 
                     outputIndex >= 0 -> {
@@ -434,10 +787,10 @@ class LocalRecorder(
                             bufferInfo.size = 0
                         }
 
-                        if (outputBuffer != null && bufferInfo.size > 0 && muxerStarted.get()) {
+                        if (outputBuffer != null && bufferInfo.size > 0) {
                             outputBuffer.position(bufferInfo.offset)
                             outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
-                            muxer?.writeSampleData(videoTrackIndex, outputBuffer, bufferInfo)
+                            writeEncodedSample(videoTrackIndex, outputBuffer, bufferInfo)
                         }
 
                         enc.releaseOutputBuffer(outputIndex, false)

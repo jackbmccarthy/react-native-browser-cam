@@ -38,6 +38,9 @@ class BrowserCameraView @JvmOverloads constructor(
     /// RTMP client for streaming
     private var rtmpClient: RtmpClient? = null
 
+    /// Microphone level monitor for the React Native audio meter
+    private var audioLevelMonitor: AudioLevelMonitor? = null
+
     // MARK: - Configuration Properties
 
     private var cameraConfig: Map<String, Any?>? = null
@@ -48,6 +51,7 @@ class BrowserCameraView @JvmOverloads constructor(
     private var pendingCameraStart: Boolean = false
     private var pendingStartStreaming: Boolean = false
     private var pendingStartRecording: Boolean = false
+    private var pendingRecordingOverlayWaitStartedAtMs: Long = 0L
     private var previewStartRetryCount: Int = 0
 
     // MARK: - Initialization
@@ -161,6 +165,7 @@ class BrowserCameraView @JvmOverloads constructor(
         android.util.Log.d(TAG, "startRecording called")
         if (!ensureCameraEnabledForOutput("recording")) return
 
+        pendingRecordingOverlayWaitStartedAtMs = 0L
         pendingStartRecording = true
         requestCameraStart()
         startPendingOutputsIfReady()
@@ -171,6 +176,7 @@ class BrowserCameraView @JvmOverloads constructor(
         android.util.Log.d(TAG, "stopRecording called")
         if (pendingStartRecording) {
             pendingStartRecording = false
+            pendingRecordingOverlayWaitStartedAtMs = 0L
             sendRecordingState("idle")
             return ""
         }
@@ -179,11 +185,13 @@ class BrowserCameraView @JvmOverloads constructor(
             val path = rtmpClient?.stopRecording() ?: ""
             sendRecordingState("idle", path)
             sendRecordingFinished(path)
+            maybeStartPreviewAudioMonitor()
             path
         } catch (error: Exception) {
             val message = error.message ?: "Failed to stop recording"
             sendRecordingState("error")
             sendError("RECORDING_FAILED", message)
+            maybeStartPreviewAudioMonitor()
             ""
         }
     }
@@ -238,6 +246,8 @@ class BrowserCameraView @JvmOverloads constructor(
     fun cleanup() {
         pendingStartStreaming = false
         pendingStartRecording = false
+        pendingRecordingOverlayWaitStartedAtMs = 0L
+        stopAudioLevelMonitor()
         shutdownCamera()
         rtmpClient?.disconnect()
         webOverlayService?.destroy()
@@ -273,14 +283,23 @@ class BrowserCameraView @JvmOverloads constructor(
         }
 
         if (pendingStartRecording) {
+            if (shouldWaitForRecordingOverlay()) {
+                return
+            }
+
             pendingStartRecording = false
+            pendingRecordingOverlayWaitStartedAtMs = 0L
             try {
+                if (isRecordingAudioEnabled()) {
+                    stopAudioLevelMonitor()
+                }
                 val path = ensureRtmpClient().startRecording(recordingConfig)
                 sendRecordingState("recording", path)
             } catch (error: Exception) {
                 val message = error.message ?: "Failed to start recording"
                 sendRecordingState("error")
                 sendError("RECORDING_FAILED", message)
+                maybeStartPreviewAudioMonitor()
             }
         }
     }
@@ -383,6 +402,7 @@ class BrowserCameraView @JvmOverloads constructor(
 
     override fun onSizeChanged(width: Int, height: Int, oldWidth: Int, oldHeight: Int) {
         super.onSizeChanged(width, height, oldWidth, oldHeight)
+        cameraService?.updateTargetRotation()
         webOverlayService?.setSize(width, height)
         if (pendingCameraStart && width > 0 && height > 0) {
             post { startCameraWhenViewReady() }
@@ -396,6 +416,7 @@ class BrowserCameraView @JvmOverloads constructor(
                 post {
                     isPreviewStreaming = true
                     previewStartRetryCount = 0
+                    startAudioLevelMonitor()
                     applyDeferredConfigs()
                     sendEvent(EVENT_CAMERA_READY)
                     startPendingOutputsIfReady()
@@ -422,8 +443,10 @@ class BrowserCameraView @JvmOverloads constructor(
         pendingCameraStart = false
         pendingStartStreaming = false
         pendingStartRecording = false
+        pendingRecordingOverlayWaitStartedAtMs = 0L
         isPreviewStreaming = false
         previewStartRetryCount = 0
+        stopAudioLevelMonitor()
         cameraService?.stop()
         cameraService = null
         if (hadCamera || previewView == null) {
@@ -489,11 +512,63 @@ class BrowserCameraView @JvmOverloads constructor(
             it.onStatsUpdate = { stats ->
                 post { sendStreamStats(stats) }
             }
+            it.onAudioLevel = { level, decibels ->
+                post { sendAudioLevel(level, decibels) }
+            }
             it.onError = { message ->
                 post { sendError("STREAM_CONNECTION_FAILED", message) }
             }
             rtmpClient = it
         }
+    }
+
+    private fun startAudioLevelMonitor() {
+        val monitor = audioLevelMonitor ?: AudioLevelMonitor(context) { level, decibels ->
+            post { sendAudioLevel(level, decibels) }
+        }.also {
+            audioLevelMonitor = it
+        }
+        monitor.start()
+    }
+
+    private fun stopAudioLevelMonitor() {
+        audioLevelMonitor?.stop()
+        audioLevelMonitor = null
+    }
+
+    private fun maybeStartPreviewAudioMonitor() {
+        if (!isPreviewStreaming) return
+        if (rtmpClient?.state == StreamState.STREAMING) return
+        startAudioLevelMonitor()
+    }
+
+    private fun isRecordingAudioEnabled(): Boolean {
+        return recordingConfig?.get("audioEnabled") as? Boolean == true
+    }
+
+    private fun shouldWaitForRecordingOverlay(): Boolean {
+        val service = webOverlayService ?: return false
+        if (!service.hasActiveOverlays()) return false
+
+        if (service.isReady) {
+            pendingRecordingOverlayWaitStartedAtMs = 0L
+            return false
+        }
+
+        val now = System.currentTimeMillis()
+        if (pendingRecordingOverlayWaitStartedAtMs == 0L) {
+            pendingRecordingOverlayWaitStartedAtMs = now
+            sendLog("Waiting for browser overlays before recording")
+        }
+
+        if (now - pendingRecordingOverlayWaitStartedAtMs >= RECORDING_OVERLAY_READY_TIMEOUT_MS) {
+            pendingRecordingOverlayWaitStartedAtMs = 0L
+            sendLog("Starting recording before browser overlays reported ready")
+            return false
+        }
+
+        postDelayed({ startPendingOutputsIfReady() }, RECORDING_OVERLAY_READY_RETRY_MS)
+        return true
     }
 
     private fun ensureCameraEnabledForOutput(outputName: String): Boolean {
@@ -537,6 +612,14 @@ class BrowserCameraView @JvmOverloads constructor(
         sendEvent(EVENT_RECORDING_FINISHED, event)
     }
 
+    private fun sendAudioLevel(level: Double, decibels: Double) {
+        val event = Arguments.createMap().apply {
+            putDouble("level", level)
+            putDouble("decibels", decibels)
+        }
+        sendEvent(EVENT_AUDIO_LEVEL, event)
+    }
+
     private fun sendError(code: String, message: String) {
         val event = Arguments.createMap().apply {
             putString("code", code)
@@ -569,6 +652,8 @@ class BrowserCameraView @JvmOverloads constructor(
         private const val CAMERA_RESTART_DELAY_MS = 1000L
         private const val PREVIEW_START_TIMEOUT_MS = 8000L
         private const val MAX_PREVIEW_START_RETRIES = 3
+        private const val RECORDING_OVERLAY_READY_RETRY_MS = 120L
+        private const val RECORDING_OVERLAY_READY_TIMEOUT_MS = 2500L
         private const val EVENT_STREAM_STATE_CHANGE = "topStreamStateChange"
         private const val EVENT_STREAM_STATS = "topStreamStats"
         private const val EVENT_ERROR = "topError"
@@ -576,6 +661,7 @@ class BrowserCameraView @JvmOverloads constructor(
         private const val EVENT_WEBVIEW_ERROR = "topWebViewError"
         private const val EVENT_CAMERA_READY = "topCameraReady"
         private const val EVENT_LOG = "topLog"
+        private const val EVENT_AUDIO_LEVEL = "topAudioLevel"
         private const val EVENT_RECORDING_STATE_CHANGE = "topRecordingStateChange"
         private const val EVENT_RECORDING_FINISHED = "topRecordingFinished"
     }
