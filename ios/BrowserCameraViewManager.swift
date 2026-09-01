@@ -79,6 +79,12 @@ class BrowserCameraViewManager: RCTViewManager {
             self?.getViewFromTag(tag)?.switchCamera()
         }
     }
+
+    @objc func focusAtPoint(_ tag: NSNumber, x: NSNumber, y: NSNumber) {
+        DispatchQueue.main.async { [weak self] in
+            self?.getViewFromTag(tag)?.focusAtPoint(x, y: y)
+        }
+    }
     
     @objc func setMuted(_ tag: NSNumber, muted: Bool) {
         DispatchQueue.main.async { [weak self] in

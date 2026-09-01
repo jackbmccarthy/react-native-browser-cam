@@ -86,6 +86,7 @@ class BrowserCameraViewManager : SimpleViewManager<BrowserCameraView>() {
             "topWebViewError" to mapOf("registrationName" to "onWebViewError"),
             "topCameraReady" to mapOf("registrationName" to "onCameraReady"),
             "topLog" to mapOf("registrationName" to "onLog"),
+            "topAudioLevel" to mapOf("registrationName" to "onAudioLevel"),
             "topRecordingStateChange" to mapOf("registrationName" to "onRecordingStateChange"),
             "topRecordingFinished" to mapOf("registrationName" to "onRecordingFinished")
         )

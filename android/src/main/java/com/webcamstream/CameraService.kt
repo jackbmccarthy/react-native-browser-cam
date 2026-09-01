@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.util.Size
 import android.util.Log
+import android.view.Surface
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
@@ -123,6 +124,15 @@ class CameraService(
         // TODO: Update camera configuration
     }
 
+    /** Keep CameraX sensor output aligned with the current locked display orientation. */
+    fun updateTargetRotation() {
+        val rotation = previewView.display?.rotation ?: Surface.ROTATION_0
+        if (preview?.targetRotation != rotation) {
+            preview?.targetRotation = rotation
+            Log.d(TAG, "Preview target rotation updated to $rotation")
+        }
+    }
+
     /** Set camera facing direction from JS config */
     fun setFacing(facing: String?) {
         val nextFacing = when (facing) {
@@ -215,9 +225,11 @@ class CameraService(
     }
 
     private fun setupPreview() {
-        Log.d(TAG, "Setting up preview use case...")
+        val targetRotation = previewView.display?.rotation ?: Surface.ROTATION_0
+        Log.d(TAG, "Setting up preview use case with targetRotation=$targetRotation")
         preview = Preview.Builder()
             .setTargetAspectRatio(AspectRatio.RATIO_16_9)
+            .setTargetRotation(targetRotation)
             .build()
             .also {
                 it.setSurfaceProvider(previewView.surfaceProvider)

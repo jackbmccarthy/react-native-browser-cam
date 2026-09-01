@@ -14,8 +14,9 @@ React Native screen
   -> preview, RTMP stream, or local MP4
 ```
 
-This project is iOS-first today. Android has the same public API shape and native
-scaffolding, but the Android camera/compositor/RTMP path is not production-ready yet.
+The library now has device-tested iOS and Android capture paths behind the same
+React Native API. Platform implementations differ internally, but both can preview,
+compose browser overlays, publish RTMP, and record local MP4 output.
 
 ## What This Library Is For
 
@@ -39,7 +40,10 @@ build or another native build.
 | iOS compositing | Implemented with Core Image, using Metal-backed rendering when available |
 | iOS RTMP streaming | Implemented with HaishinKit and sample-buffer ingest |
 | iOS local recording | Implemented with `AVAssetWriter`; recordings are written to a temp MP4 and then saved to Photos when authorized |
-| Android | API and service scaffolding exist; RTMP streaming and recording are not implemented |
+| Android camera preview | Implemented with CameraX and `PreviewView` |
+| Android browser overlay | Implemented with native WebViews and configurable viewport/zoom |
+| Android RTMP streaming | Implemented with RootEncoder, microphone audio, stats, and reconnect support |
+| Android local recording | Implemented with MediaCodec/MediaMuxer, composited overlays, and AAC audio |
 | Web | Not supported |
 
 ## Public API At A Glance
@@ -64,6 +68,7 @@ The main ref methods are:
 - `startRecording()` / `stopRecording()`
 - `snapshot()`
 - `switchCamera()`
+- `focusAtPoint(x, y)`
 - `reloadWebView()` / `loadUrl(url)` / `injectJavaScript(js)`
 - `setMuted(muted)`
 - `getStreamState()` / `getStreamStats()`
@@ -93,16 +98,16 @@ above it, while streaming and recording use the compositor output.
 
 ## Runtime Flow On Android
 
-The Android package mirrors the iOS class names and public surface, but most heavy
-lifting is still marked as TODO:
+The Android package mirrors the iOS public surface with platform-specific services:
 
-- [android/src/main/java/com/webcamstream/CameraService.kt](android/src/main/java/com/webcamstream/CameraService.kt) plans to use CameraX.
-- [android/src/main/java/com/webcamstream/WebOverlayService.kt](android/src/main/java/com/webcamstream/WebOverlayService.kt) creates a WebView and can draw it into a bitmap.
-- [android/src/main/java/com/webcamstream/GlCompositor.kt](android/src/main/java/com/webcamstream/GlCompositor.kt) contains shader and texture scaffolding.
-- [android/src/main/java/com/webcamstream/RtmpClient.kt](android/src/main/java/com/webcamstream/RtmpClient.kt) intentionally reports that Android RTMP is not implemented.
+- [android/src/main/java/com/webcamstream/CameraService.kt](android/src/main/java/com/webcamstream/CameraService.kt) binds CameraX preview and applies rotation/focus configuration.
+- [android/src/main/java/com/webcamstream/WebOverlayService.kt](android/src/main/java/com/webcamstream/WebOverlayService.kt) manages native browser overlays without reloading them for layout or zoom changes.
+- [android/src/main/java/com/webcamstream/RtmpClient.kt](android/src/main/java/com/webcamstream/RtmpClient.kt) publishes the composed production canvas with RootEncoder.
+- [android/src/main/java/com/webcamstream/LocalRecorder.kt](android/src/main/java/com/webcamstream/LocalRecorder.kt) writes composited H.264/AAC MP4 recordings.
+- [android/src/main/java/com/webcamstream/AudioLevelMonitor.kt](android/src/main/java/com/webcamstream/AudioLevelMonitor.kt) supplies microphone signal events outside active encoders.
 
-Treat Android as an API scaffold and future implementation lane, not as a working
-streaming platform.
+Android has been validated on physical hardware. Add device coverage before a
+production release because encoder, camera, and orientation behavior can differ by OEM.
 
 ## Repository Map
 
@@ -111,7 +116,7 @@ streaming platform.
 | [src/index.tsx](src/index.tsx) | React Native component wrapper and exports |
 | [src/types.ts](src/types.ts) | Public TypeScript API types |
 | [ios/](ios) | iOS native implementation |
-| [android/](android) | Android native scaffold |
+| [android/](android) | Android native camera, browser, RTMP, and recording implementation |
 | [app.plugin.js](app.plugin.js) | Expo config plugin for native permissions |
 | [react-native-browser-cam.podspec](react-native-browser-cam.podspec) | CocoaPods metadata and iOS dependencies |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Native architecture and service responsibilities |
@@ -135,9 +140,9 @@ npx expo prebuild
 npx expo run:ios
 ```
 
-End-to-end iOS testing needs a physical iPhone or iPad because the simulator does
-not provide the same camera capture path. Expo Go is not enough because this package
-contains custom native code.
+End-to-end testing needs physical iOS and Android hardware because simulators do
+not provide the same camera, microphone, encoder, and orientation paths. Expo Go
+is not enough because this package contains custom native code.
 
 ## Where To Start Changing Things
 
@@ -149,17 +154,16 @@ contains custom native code.
   [ios/CompositorService.swift](ios/CompositorService.swift).
 - iOS RTMP or recording: start in [ios/StreamService.swift](ios/StreamService.swift).
 - Expo permissions: start in [app.plugin.js](app.plugin.js).
-- Android implementation: start by replacing the TODO scaffolding in
-  `CameraService.kt`, `GlCompositor.kt`, and `RtmpClient.kt`.
+- Android camera behavior: start in `CameraService.kt` and `BrowserCameraView.kt`.
+- Android streaming/recording: start in `RtmpClient.kt` and `LocalRecorder.kt`.
 
 ## Known Limitations
 
-- Android cannot stream or record yet.
 - Expo Go is not supported.
 - WebView overlays are snapshot-based for compositing, so complex or fast-changing
   web content can be expensive.
-- iOS WebView audio is not mixed into the stream; microphone audio is the practical
-  V1 path.
+- WebView audio is not mixed into the stream; microphone audio is the practical
+  V1 path on both platforms.
 - Some JavaScript ref methods still need promise-based native return plumbing.
 - The iOS simulator is useful for layout and bridge checks, but not for full
   camera/stream validation.

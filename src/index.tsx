@@ -21,6 +21,8 @@ import {
 // Type exports
 export type {
   CameraFacing,
+  CameraDeviceInfo,
+  AudioInputDeviceInfo,
   CameraConfig,
   WebViewConfig,
   StreamConfig,
@@ -28,6 +30,7 @@ export type {
   StreamState,
   RecordingState,
   StreamStats,
+  AudioLevelEvent,
   StreamEvent,
   SnapshotOptions,
   SnapshotResult,
@@ -48,6 +51,8 @@ export {
 import type {
   BrowserCamViewProps,
   BrowserCamRef,
+  CameraDeviceInfo,
+  AudioInputDeviceInfo,
   RecordingState,
   StreamState,
   StreamStats,
@@ -76,6 +81,7 @@ interface NativeBrowserCamViewProps extends ViewProps {
   recordingConfig?: any;
   onStreamStateChange?: (event: any) => void;
   onStreamStats?: (event: any) => void;
+  onAudioLevel?: (event: any) => void;
   onError?: (event: any) => void;
   onWebViewLoad?: (event: any) => void;
   onWebViewError?: (event: any) => void;
@@ -132,6 +138,7 @@ export const BrowserCamView = forwardRef<BrowserCamRef, BrowserCamViewProps>(
       recordingConfig,
       onStreamStateChange,
       onStreamStats,
+      onAudioLevel,
       onError,
       onWebViewLoad,
       onWebViewError,
@@ -251,6 +258,13 @@ export const BrowserCamView = forwardRef<BrowserCamRef, BrowserCamViewProps>(
         }
       },
 
+      focusAtPoint: (x: number, y: number) => {
+        const tag = getViewTag();
+        if (tag) {
+          dispatchCommand(tag, 'focusAtPoint', [x, y]);
+        }
+      },
+
       setMuted: (muted: boolean) => {
         const tag = getViewTag();
         if (tag) {
@@ -320,6 +334,7 @@ export const BrowserCamView = forwardRef<BrowserCamRef, BrowserCamViewProps>(
         recordingConfig={recordingConfig}
         onStreamStateChange={handleStreamStateChange}
         onStreamStats={(e) => onStreamStats?.(e.nativeEvent)}
+        onAudioLevel={(e) => onAudioLevel?.(e.nativeEvent)}
         onError={handleError}
         onWebViewLoad={() => onWebViewLoad?.()}
         onWebViewError={(e) => onWebViewError?.(e.nativeEvent)}
@@ -343,10 +358,30 @@ BrowserCamView.displayName = 'BrowserCamView';
 export const BrowserCameraView = BrowserCamView;
 export default BrowserCamView;
 
-export const FileSystemUtils = NativeModules.BrowserCameraModule || {
+const BrowserCameraModule = NativeModules.BrowserCameraModule || {};
+
+export const FileSystemUtils = {
   getDocumentDirectory: async () => '',
   listRecordings: async () => [],
   deleteRecording: async (_uri: string) => false,
+  ...BrowserCameraModule,
+};
+
+export const CameraDeviceUtils: {
+  getAvailableCameras: () => Promise<CameraDeviceInfo[]>;
+} = {
+  getAvailableCameras: BrowserCameraModule.getAvailableCameras || (async () => [
+    { id: 'back', label: 'Back Camera', position: 'back' },
+    { id: 'front', label: 'Front Camera', position: 'front' },
+  ]),
+};
+
+export const AudioDeviceUtils: {
+  getAvailableAudioInputs: () => Promise<AudioInputDeviceInfo[]>;
+} = {
+  getAvailableAudioInputs: BrowserCameraModule.getAvailableAudioInputs || (async () => [
+    { id: 'default', label: 'Default Microphone', portType: 'default', isSelected: true },
+  ]),
 };
 
 // Re-export types
