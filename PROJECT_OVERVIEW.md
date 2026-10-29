@@ -14,8 +14,9 @@ React Native screen
   -> preview, RTMP stream, or local MP4
 ```
 
-This project is iOS-first today. Android has the same public API shape and native
-scaffolding, but the Android camera/compositor/RTMP path is not production-ready yet.
+Both native pipelines are implemented. The collected Android and iOS sources still
+need native build and physical-device qualification before a release; portable
+JavaScript tests are not evidence that those native paths work on a device.
 
 ## What This Library Is For
 
@@ -39,7 +40,7 @@ build or another native build.
 | iOS compositing | Implemented with Core Image, using Metal-backed rendering when available |
 | iOS RTMP streaming | Implemented with HaishinKit and sample-buffer ingest |
 | iOS local recording | Implemented with `AVAssetWriter`; recordings are written to a temp MP4 and then saved to Photos when authorized |
-| Android | API and service scaffolding exist; RTMP streaming and recording are not implemented |
+| Android | CameraX, optional GPU browser/camera composition, RootEncoder RTMP, and local MP4/audio recording are implemented |
 | Web | Not supported |
 
 ## Public API At A Glance
@@ -61,6 +62,7 @@ The main props are:
 The main ref methods are:
 
 - `startStreaming()` / `stopStreaming()`
+- `configureAndStartStreaming(config, sessionId)` / `stopStreamingAndWait(sessionId)`
 - `startRecording()` / `stopRecording()`
 - `snapshot()`
 - `switchCamera()`
@@ -68,10 +70,14 @@ The main ref methods are:
 - `setMuted(muted)`
 - `getStreamState()` / `getStreamStats()`
 
+Hardware device-ID/input selection and tap-to-focus are currently iOS-only.
+Android uses facing selection and the default microphone; device utility results
+there are fallback descriptors rather than physical hardware enumeration.
+
 Important bridge note: the native iOS implementation contains methods that return
-snapshot, recording, state, and stats values, but the current JavaScript wrapper
-dispatches most calls as view-manager commands. That means some result-returning
-ref methods still return placeholders from JS until the bridge is tightened.
+snapshot, recording, state, and stats values. The managed streaming methods wait
+for matching native session/command results; `stopRecording` waits for its native
+completion event. `snapshot()` and `getStreamStats()` still return JS placeholders.
 
 ## Runtime Flow On iOS
 
@@ -93,16 +99,14 @@ above it, while streaming and recording use the compositor output.
 
 ## Runtime Flow On Android
 
-The Android package mirrors the iOS class names and public surface, but most heavy
-lifting is still marked as TODO:
+CameraX supplies capture. The opt-in API 31+ path combines camera and browser
+surfaces in `GpuSceneRenderer`, with `GpuBrowserOverlayService` hosting hardware
+WebViews. It feeds preview and encoder surfaces without a per-frame JavaScript
+image transfer. Legacy software browser capture remains available.
 
-- [android/src/main/java/com/webcamstream/CameraService.kt](android/src/main/java/com/webcamstream/CameraService.kt) plans to use CameraX.
-- [android/src/main/java/com/webcamstream/WebOverlayService.kt](android/src/main/java/com/webcamstream/WebOverlayService.kt) creates a WebView and can draw it into a bitmap.
-- [android/src/main/java/com/webcamstream/GlCompositor.kt](android/src/main/java/com/webcamstream/GlCompositor.kt) contains shader and texture scaffolding.
-- [android/src/main/java/com/webcamstream/RtmpClient.kt](android/src/main/java/com/webcamstream/RtmpClient.kt) intentionally reports that Android RTMP is not implemented.
-
-Treat Android as an API scaffold and future implementation lane, not as a working
-streaming platform.
+`RtmpClient` integrates RootEncoder for RTMP and local recording, microphone
+samples, managed command acknowledgments, and native save completion. GPU mode
+does not move audio encoding, networking, or all WebView work onto the GPU.
 
 ## Repository Map
 
@@ -111,7 +115,7 @@ streaming platform.
 | [src/index.tsx](src/index.tsx) | React Native component wrapper and exports |
 | [src/types.ts](src/types.ts) | Public TypeScript API types |
 | [ios/](ios) | iOS native implementation |
-| [android/](android) | Android native scaffold |
+| [android/](android) | CameraX, browser rendering, GPU composition, RTMP, and recording |
 | [app.plugin.js](app.plugin.js) | Expo config plugin for native permissions |
 | [react-native-browser-cam.podspec](react-native-browser-cam.podspec) | CocoaPods metadata and iOS dependencies |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Native architecture and service responsibilities |
@@ -149,12 +153,12 @@ contains custom native code.
   [ios/CompositorService.swift](ios/CompositorService.swift).
 - iOS RTMP or recording: start in [ios/StreamService.swift](ios/StreamService.swift).
 - Expo permissions: start in [app.plugin.js](app.plugin.js).
-- Android implementation: start by replacing the TODO scaffolding in
-  `CameraService.kt`, `GlCompositor.kt`, and `RtmpClient.kt`.
+- Android implementation: start in `CameraService.kt`, `GpuSceneRenderer.kt`,
+  `GpuBrowserOverlayService.kt`, and `RtmpClient.kt`.
 
 ## Known Limitations
 
-- Android cannot stream or record yet.
+- The exact contributed snapshot still needs Android/iOS native builds and device tests.
 - Expo Go is not supported.
 - WebView overlays are snapshot-based for compositing, so complex or fast-changing
   web content can be expensive.

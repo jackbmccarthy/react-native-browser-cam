@@ -12,15 +12,20 @@ import {
   UIManager,
   findNodeHandle,
   NativeModules,
+  Platform,
   requireNativeComponent,
   ViewProps,
 } from 'react-native';
 // codegenNativeComponent is for New Architecture, but since we are troubleshooting 
 // we'll use requireNativeComponent which is more robust for Old Arch / Hybrid.
 
+import { StreamCommands } from './StreamCommands';
+
 // Type exports
 export type {
   CameraFacing,
+  CameraDeviceInfo,
+  AudioInputDeviceInfo,
   CameraConfig,
   WebViewConfig,
   StreamConfig,
@@ -28,6 +33,7 @@ export type {
   StreamState,
   RecordingState,
   StreamStats,
+  AudioLevelEvent,
   StreamEvent,
   SnapshotOptions,
   SnapshotResult,
@@ -48,7 +54,10 @@ export {
 import type {
   BrowserCamViewProps,
   BrowserCamRef,
+  CameraDeviceInfo,
+  AudioInputDeviceInfo,
   RecordingState,
+  StreamConfig,
   StreamState,
   StreamStats,
   SnapshotOptions,
@@ -74,8 +83,10 @@ interface NativeBrowserCamViewProps extends ViewProps {
   webViewConfig?: any;
   streamConfig?: any;
   recordingConfig?: any;
+  onStreamCommandResult?: (event: any) => void;
   onStreamStateChange?: (event: any) => void;
   onStreamStats?: (event: any) => void;
+  onAudioLevel?: (event: any) => void;
   onError?: (event: any) => void;
   onWebViewLoad?: (event: any) => void;
   onWebViewError?: (event: any) => void;
@@ -132,6 +143,7 @@ export const BrowserCamView = forwardRef<BrowserCamRef, BrowserCamViewProps>(
       recordingConfig,
       onStreamStateChange,
       onStreamStats,
+      onAudioLevel,
       onError,
       onWebViewLoad,
       onWebViewError,
@@ -160,8 +172,27 @@ export const BrowserCamView = forwardRef<BrowserCamRef, BrowserCamViewProps>(
       return null;
     }, []);
 
+    const streamCommandsRef = useRef<StreamCommands | null>(null);
+    const getStreamCommands = useCallback(() => {
+      if (!streamCommandsRef.current) {
+        streamCommandsRef.current = new StreamCommands(getViewTag, (tag, command, args) => {
+          const commands = UIManager.getViewManagerConfig(ComponentName)?.Commands;
+          if (commands?.[command] == null) throw new Error('Native streaming commands are not installed');
+          dispatchCommand(tag, command, args);
+        });
+      }
+      return streamCommandsRef.current;
+    }, [getViewTag]);
+
+    React.useEffect(() => () => {
+      streamCommandsRef.current?.dispose();
+      streamCommandsRef.current = null;
+    }, []);
+
     // Expose methods via ref
     useImperativeHandle(ref, () => ({
+      configureAndStartStreaming: (config: StreamConfig, sessionId: string) => getStreamCommands().configureAndStartStreaming(config, sessionId),
+      stopStreamingAndWait: (sessionId: string) => getStreamCommands().stopStreamingAndWait(sessionId),
       startStreaming: async () => {
         const tag = getViewTag();
         if (tag) {
@@ -197,12 +228,21 @@ export const BrowserCamView = forwardRef<BrowserCamRef, BrowserCamViewProps>(
           const timeout = setTimeout(() => {
             if (pendingStopRecordingRef.current) {
               pendingStopRecordingRef.current = null;
-              resolve(latestRecordingPathRef.current);
+              reject(Object.assign(new Error('Native recording stop timed out; completion is uncertain'), { code: 'RECORDING_STOP_TIMEOUT' }));
             }
-          }, 5000);
+          }, 60000);
 
-          pendingStopRecordingRef.current = { resolve, reject, timeout };
-          dispatchCommand(tag, 'stopRecording');
+          const pending = { resolve, reject, timeout };
+          pendingStopRecordingRef.current = pending;
+          try {
+            dispatchCommand(tag, 'stopRecording');
+          } catch (error) {
+            if (pendingStopRecordingRef.current === pending) {
+              clearTimeout(timeout);
+              pendingStopRecordingRef.current = null;
+              reject(error);
+            }
+          }
         });
       },
 
@@ -251,13 +291,21 @@ export const BrowserCamView = forwardRef<BrowserCamRef, BrowserCamViewProps>(
         }
       },
 
+      focusAtPoint: (x: number, y: number) => {
+        if (Platform.OS !== 'ios') return;
+        const tag = getViewTag();
+        if (tag) {
+          dispatchCommand(tag, 'focusAtPoint', [x, y]);
+        }
+      },
+
       setMuted: (muted: boolean) => {
         const tag = getViewTag();
         if (tag) {
           dispatchCommand(tag, 'setMuted', [muted]);
         }
       },
-    }), [getViewTag]);
+    }), [getViewTag, getStreamCommands]);
 
     const handleStreamStateChange = useCallback((e: any) => {
       const state = e.nativeEvent.state as StreamState;
@@ -283,18 +331,19 @@ export const BrowserCamView = forwardRef<BrowserCamRef, BrowserCamViewProps>(
       if (pending) {
         clearTimeout(pending.timeout);
         pendingStopRecordingRef.current = null;
-        pending.resolve(path);
+        if (path.trim()) pending.resolve(path);
+        else pending.reject(Object.assign(new Error('Native recording completion has no file path'), { code: 'RECORDING_FAILED' }));
       }
       onRecordingFinished?.(path);
     }, [onRecordingFinished]);
 
     const handleError = useCallback((e: any) => {
       const error = e.nativeEvent as { code: string; message: string };
-      if (error.code === 'RECORDING_FAILED' && pendingStopRecordingRef.current) {
+      if ((error.code === 'RECORDING_FAILED' || error.code === 'RECORDING_CANCELLED') && pendingStopRecordingRef.current) {
         const pending = pendingStopRecordingRef.current;
         clearTimeout(pending.timeout);
         pendingStopRecordingRef.current = null;
-        pending.reject(new Error(error.message));
+        pending.reject(Object.assign(new Error(error.message), { code: error.code }));
       }
       onError?.(error);
     }, [onError]);
@@ -305,7 +354,7 @@ export const BrowserCamView = forwardRef<BrowserCamRef, BrowserCamViewProps>(
         if (pending) {
           clearTimeout(pending.timeout);
           pendingStopRecordingRef.current = null;
-          pending.resolve(latestRecordingPathRef.current);
+          pending.reject(Object.assign(new Error('Camera view unmounted before recording completion'), { code: 'RECORDING_STOP_CANCELLED' }));
         }
       };
     }, []);
@@ -318,8 +367,10 @@ export const BrowserCamView = forwardRef<BrowserCamRef, BrowserCamViewProps>(
         webViewConfig={webViewConfig}
         streamConfig={streamConfig}
         recordingConfig={recordingConfig}
+        onStreamCommandResult={(e) => streamCommandsRef.current?.handleResult(e.nativeEvent)}
         onStreamStateChange={handleStreamStateChange}
         onStreamStats={(e) => onStreamStats?.(e.nativeEvent)}
+        onAudioLevel={(e) => onAudioLevel?.(e.nativeEvent)}
         onError={handleError}
         onWebViewLoad={() => onWebViewLoad?.()}
         onWebViewError={(e) => onWebViewError?.(e.nativeEvent)}
@@ -343,10 +394,30 @@ BrowserCamView.displayName = 'BrowserCamView';
 export const BrowserCameraView = BrowserCamView;
 export default BrowserCamView;
 
-export const FileSystemUtils = NativeModules.BrowserCameraModule || {
+const BrowserCameraModule = NativeModules.BrowserCameraModule || {};
+
+export const FileSystemUtils = {
   getDocumentDirectory: async () => '',
   listRecordings: async () => [],
   deleteRecording: async (_uri: string) => false,
+  ...BrowserCameraModule,
+};
+
+export const CameraDeviceUtils: {
+  getAvailableCameras: () => Promise<CameraDeviceInfo[]>;
+} = {
+  getAvailableCameras: BrowserCameraModule.getAvailableCameras || (async () => [
+    { id: 'back', label: 'Back Camera', position: 'back' },
+    { id: 'front', label: 'Front Camera', position: 'front' },
+  ]),
+};
+
+export const AudioDeviceUtils: {
+  getAvailableAudioInputs: () => Promise<AudioInputDeviceInfo[]>;
+} = {
+  getAvailableAudioInputs: BrowserCameraModule.getAvailableAudioInputs || (async () => [
+    { id: 'default', label: 'Default Microphone', portType: 'default', isSelected: true },
+  ]),
 };
 
 // Re-export types

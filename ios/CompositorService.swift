@@ -17,9 +17,12 @@ class CompositorService: NSObject {
     
     /// Core Image context for GPU processing
     private var ciContext: CIContext?
+    private let deviceRGBColorSpace = CGColorSpaceCreateDeviceRGB()
     
     /// Pixel buffer pool for efficient buffer reuse
     private var pixelBufferPool: CVPixelBufferPool?
+    private let formatDescriptionLock = NSLock()
+    private var outputFormatDescription: CMVideoFormatDescription?
     
     /// Output dimensions (current)
     var outputWidth: Int = 1920
@@ -59,7 +62,7 @@ class CompositorService: NSObject {
         // Create CIContext with Metal for GPU acceleration
         if let metalDevice = MTLCreateSystemDefaultDevice() {
             ciContext = CIContext(mtlDevice: metalDevice, options: [
-                .workingColorSpace: CGColorSpaceCreateDeviceRGB(),
+                .workingColorSpace: deviceRGBColorSpace,
                 .highQualityDownsample: true,
                 .cacheIntermediates: false
             ])
@@ -181,7 +184,7 @@ class CompositorService: NSObject {
             return cameraBuffer
         }
         
-        ciContext.render(compositedImage, to: outputBuffer, bounds: CGRect(x: 0, y: 0, width: outputWidth, height: outputHeight), colorSpace: CGColorSpaceCreateDeviceRGB())
+        ciContext.render(compositedImage, to: outputBuffer, bounds: CGRect(x: 0, y: 0, width: outputWidth, height: outputHeight), colorSpace: deviceRGBColorSpace)
         
         // 6. Create new CMSampleBuffer from output pixel buffer
         var timing = CMSampleTimingInfo(from: cameraBuffer)
@@ -248,7 +251,7 @@ class CompositorService: NSObject {
         }
         
         let outputRect = CGRect(x: 0, y: 0, width: outputWidth, height: outputHeight)
-        ciContext.render(compositedImage, to: outputBuffer, bounds: outputRect, colorSpace: CGColorSpaceCreateDeviceRGB())
+        ciContext.render(compositedImage, to: outputBuffer, bounds: outputRect, colorSpace: deviceRGBColorSpace)
         
         return outputBuffer
     }
@@ -256,6 +259,18 @@ class CompositorService: NSObject {
     // MARK: - Private Methods
     
     private func createPixelBufferPool() {
+        if let pool = pixelBufferPool,
+           let attributes = CVPixelBufferPoolGetPixelBufferAttributes(pool) as? [String: Any],
+           let width = attributes[kCVPixelBufferWidthKey as String] as? NSNumber,
+           let height = attributes[kCVPixelBufferHeightKey as String] as? NSNumber,
+           width.intValue == outputWidth, height.intValue == outputHeight {
+            return
+        }
+
+        formatDescriptionLock.lock()
+        outputFormatDescription = nil
+        formatDescriptionLock.unlock()
+
         // Release existing pool
         pixelBufferPool = nil
         
@@ -307,19 +322,33 @@ class CompositorService: NSObject {
         return pixelBuffer
     }
     
-    private func createSampleBuffer(from pixelBuffer: CVPixelBuffer, timing: CMSampleTimingInfo? = nil) -> CMSampleBuffer? {
-        // Create format description
+    private func formatDescription(for pixelBuffer: CVPixelBuffer) -> CMVideoFormatDescription? {
+        formatDescriptionLock.lock()
+        defer { formatDescriptionLock.unlock() }
+
+        if let format = outputFormatDescription,
+           CMVideoFormatDescriptionMatchesImageBuffer(format, imageBuffer: pixelBuffer) {
+            return format
+        }
+
         var formatDescription: CMVideoFormatDescription?
         let formatStatus = CMVideoFormatDescriptionCreateForImageBuffer(
             allocator: kCFAllocatorDefault,
             imageBuffer: pixelBuffer,
             formatDescriptionOut: &formatDescription
         )
-        
+
         guard formatStatus == noErr, let format = formatDescription else {
             print("[CompositorService] Failed to create format description")
             return nil
         }
+
+        outputFormatDescription = format
+        return format
+    }
+
+    private func createSampleBuffer(from pixelBuffer: CVPixelBuffer, timing: CMSampleTimingInfo? = nil) -> CMSampleBuffer? {
+        guard let format = formatDescription(for: pixelBuffer) else { return nil }
         
         // Create timing info
         var sampleTiming: CMSampleTimingInfo

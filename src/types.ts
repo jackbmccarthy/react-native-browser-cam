@@ -9,6 +9,7 @@
 // ============================================================================
 
 export type CameraFacing = 'front' | 'back';
+export type CameraResolution = '720p' | '1080p' | '4K';
 export type CameraOrientation =
   | 'auto'
   | 'portrait'
@@ -18,14 +19,50 @@ export type CameraOrientation =
   | 'landscapeRight';
 
 export interface CameraConfig {
+  /** Android-only native rendering path. GPU mode is opt-in; iOS ignores this. */
+  androidRendering?: 'gpu' | 'legacy';
   /** Camera facing direction */
   facing: CameraFacing;
+  /** iOS native camera identifier; takes priority over facing on iOS. Android currently uses facing. */
+  deviceId?: string;
   /** Target frame rate (default: 30) */
   fps?: number;
+  /** iOS capture resolution preset. Android output dimensions come from stream/recording configuration. */
+  resolution?: CameraResolution;
   /** Enable/disable camera */
   enabled?: boolean;
   /** Camera orientation. Use `auto` to follow device rotation. */
   orientation?: CameraOrientation;
+  /** iOS preferred audio input identifier. Android currently uses its system-default microphone. */
+  audioInputId?: string;
+  /** iOS continuous autofocus setting; disable to lock after tap-to-focus. */
+  autoFocusEnabled?: boolean;
+}
+
+export interface CameraDeviceInfo {
+  /** Native camera identifier, or a facing token when only fallback descriptors are available */
+  id: string;
+  /** Human-readable camera label */
+  label: string;
+  /** Camera position on the device */
+  position: 'front' | 'back' | 'unspecified';
+  /** Native camera/device type, when available */
+  deviceType?: string;
+  /** Whether the camera reports autofocus support */
+  supportsAutoFocus?: boolean;
+  /** Whether the camera supports tap-to-focus points */
+  supportsFocusPoint?: boolean;
+}
+
+export interface AudioInputDeviceInfo {
+  /** Native audio input identifier */
+  id: string;
+  /** Human-readable microphone/input label */
+  label: string;
+  /** Native input port type, when available */
+  portType?: string;
+  /** Whether this input is currently selected by the OS session */
+  isSelected?: boolean;
 }
 
 // ============================================================================
@@ -45,6 +82,10 @@ export interface BrowserOverlayConfig {
   width?: number;
   /** Height relative to the video frame (0-1) */
   height?: number;
+  /** Browser viewport width in CSS pixels before scaling into the overlay frame */
+  viewportWidth?: number;
+  /** Browser viewport height in CSS pixels before scaling into the overlay frame */
+  viewportHeight?: number;
   /** Content zoom level */
   zoom?: number;
   /** Overlay opacity from 0-1 */
@@ -64,7 +105,7 @@ export interface WebViewConfig {
   transparent?: boolean;
   /** Inject custom CSS/JS into the WebView */
   injectedJavaScript?: string;
-  /** WebView update throttle in ms (default: 50ms ~ 20fps) */
+  /** WebView update throttle in ms (default: 33ms, approximately 30fps when resources permit) */
   updateThrottleMs?: number;
   /** X position (0-1 or pixels, default: 0) */
   x?: number;
@@ -126,7 +167,7 @@ export interface RecordingConfig {
 
 export type StreamState = 'idle' | 'connecting' | 'streaming' | 'error' | 'disconnected';
 
-export type RecordingState = 'idle' | 'recording' | 'paused' | 'error';
+export type RecordingState = 'idle' | 'recording' | 'paused' | 'processing' | 'error';
 
 export interface StreamStats {
   /** Current bitrate in bps */
@@ -137,6 +178,15 @@ export interface StreamStats {
   droppedFrames: number;
   /** Stream duration in seconds */
   duration: number;
+}
+
+export interface AudioLevelEvent {
+  /** True when audio sample buffers are currently reaching the native camera service */
+  active: boolean;
+  /** Normalized input level from 0-1. */
+  level: number;
+  /** Approximate dBFS input level. This is not calibrated SPL. */
+  decibels?: number;
 }
 
 export interface StreamEvent {
@@ -192,6 +242,8 @@ export interface BrowserCamViewProps {
   onStreamStateChange?: (state: StreamState) => void;
   /** Called periodically with stream statistics */
   onStreamStats?: (stats: StreamStats) => void;
+  /** Called periodically when native microphone buffers are flowing */
+  onAudioLevel?: (event: AudioLevelEvent) => void;
   /** Called when an error occurs */
   onError?: (error: { code: string; message: string }) => void;
   /** Called when WebView finishes loading */
@@ -215,6 +267,10 @@ export interface BrowserCamViewProps {
 // ============================================================================
 
 export interface BrowserCamRef {
+  /** Apply configuration atomically, then await native publish acknowledgment. Use a unique session ID. */
+  configureAndStartStreaming: (config: StreamConfig, sessionId: string) => Promise<void>;
+  /** Await explicit native publisher teardown. Cancels an in-flight start for this session. */
+  stopStreamingAndWait: (sessionId: string) => Promise<void>;
   /** Start streaming to RTMP server */
   startStreaming: () => Promise<void>;
   /** Stop streaming */
@@ -237,6 +293,8 @@ export interface BrowserCamRef {
   getStreamStats: () => Promise<StreamStats>;
   /** Switch camera facing */
   switchCamera: () => void;
+  /** iOS-only focus/exposure point. No-op on Android until its native command is implemented. */
+  focusAtPoint: (x: number, y: number) => void;
   /** Mute/unmute audio */
   setMuted: (muted: boolean) => void;
 }
@@ -273,6 +331,9 @@ export interface NativeBrowserCamModule {
 
   // Camera control
   switchCamera: (viewTag: number) => void;
+  focusAtPoint: (viewTag: number, x: number, y: number) => void;
+  getAvailableCameras?: () => Promise<CameraDeviceInfo[]>;
+  getAvailableAudioInputs?: () => Promise<AudioInputDeviceInfo[]>;
 
   // Audio control
   setMuted: (viewTag: number, muted: boolean) => void;
@@ -308,6 +369,7 @@ export enum BrowserCamErrorCode {
   STREAM_DISCONNECTED = 'STREAM_DISCONNECTED',
   ENCODER_ERROR = 'ENCODER_ERROR',
   RECORDING_FAILED = 'RECORDING_FAILED',
+  RECORDING_CANCELLED = 'RECORDING_CANCELLED',
   SNAPSHOT_FAILED = 'SNAPSHOT_FAILED',
   INVALID_CONFIG = 'INVALID_CONFIG',
   UNKNOWN_ERROR = 'UNKNOWN_ERROR',

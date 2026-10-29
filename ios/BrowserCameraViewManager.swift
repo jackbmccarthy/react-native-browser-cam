@@ -23,6 +23,18 @@ class BrowserCameraViewManager: RCTViewManager {
     
     // MARK: - Exposed Methods
     
+    @objc func configureAndStartStreaming(_ tag: NSNumber, config: NSDictionary, sessionId: String, commandId: String) {
+        DispatchQueue.main.async { [weak self] in
+            self?.getViewFromTag(tag)?.configureAndStartStreaming(config as? [String: Any] ?? [:], sessionId: sessionId, commandId: commandId)
+        }
+    }
+
+    @objc func stopStreamingAndWait(_ tag: NSNumber, sessionId: String, commandId: String) {
+        DispatchQueue.main.async { [weak self] in
+            self?.getViewFromTag(tag)?.stopStreamingAndWait(sessionId, commandId: commandId)
+        }
+    }
+
     @objc func startStreaming(_ tag: NSNumber) {
         DispatchQueue.main.async { [weak self] in
             self?.getViewFromTag(tag)?.startStreaming()
@@ -77,6 +89,12 @@ class BrowserCameraViewManager: RCTViewManager {
     @objc func switchCamera(_ tag: NSNumber) {
         DispatchQueue.main.async { [weak self] in
             self?.getViewFromTag(tag)?.switchCamera()
+        }
+    }
+
+    @objc func focusAtPoint(_ tag: NSNumber, x: NSNumber, y: NSNumber) {
+        DispatchQueue.main.async { [weak self] in
+            self?.getViewFromTag(tag)?.focusAtPoint(x, y: y)
         }
     }
     
