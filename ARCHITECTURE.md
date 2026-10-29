@@ -20,7 +20,7 @@ and browser pixels in JavaScript would not be fast or reliable enough for live v
 | Platform | Architecture state |
 | --- | --- |
 | iOS | Primary implementation. Camera, WebView overlay capture, compositing, RTMP streaming, and local recording are implemented. |
-| Android | Public API and native class scaffolding exist. CameraX, OpenGL compositing, RTMP, recording, and event callbacks still need completion. |
+| Android | CameraX, opt-in surface/GPU composition, RootEncoder RTMP/audio recording, and React event delivery are implemented; exact-snapshot native/device qualification remains open. |
 | Expo | Supported through the config plugin and development builds. Expo Go is not supported. |
 | Web | Not supported. |
 
@@ -65,10 +65,10 @@ commands through `UIManager.dispatchViewManagerCommand`.
 
 The component exports `BrowserCameraView` as a backward-compatible alias.
 
-Current bridge limitation: command-style methods are easy to dispatch but do not
-carry native return values back to JavaScript. The native iOS view can create
-snapshot and recording paths, while the JavaScript wrapper currently returns
-placeholders for some of those methods.
+Managed streaming commands carry session and command IDs. Their promises settle
+only on matching native acknowledgments; a timeout is not teardown evidence.
+Recording stop waits for a nonempty completion path. Snapshot and stream-stat
+ref methods still return JS placeholders and are not upgraded by this work.
 
 ## iOS Native Layer
 
@@ -114,20 +114,22 @@ For compositing, `WebOverlayService` uses `WKWebView.takeSnapshot` at the config
 
 ## Android Native Layer
 
-The Android implementation mirrors the iOS public shape but remains scaffolded:
+The Android implementation retains a legacy path and adds an opt-in GPU path:
 
 | Class | File | Current state |
 | --- | --- | --- |
 | `BrowserCameraView` | [android/src/main/java/com/webcamstream/BrowserCameraView.kt](android/src/main/java/com/webcamstream/BrowserCameraView.kt) | Creates service objects, accepts config props, dispatches commands. |
-| `CameraService` | [android/src/main/java/com/webcamstream/CameraService.kt](android/src/main/java/com/webcamstream/CameraService.kt) | CameraX plan with stubbed start/bind behavior. |
-| `WebOverlayService` | [android/src/main/java/com/webcamstream/WebOverlayService.kt](android/src/main/java/com/webcamstream/WebOverlayService.kt) | Creates a WebView and bitmap capture path, but efficient continuous capture is not complete. |
+| `CameraService` | [android/src/main/java/com/webcamstream/CameraService.kt](android/src/main/java/com/webcamstream/CameraService.kt) | CameraX lifecycle, facing selection, orientation, and renderer surface binding. |
+| `WebOverlayService` | [android/src/main/java/com/webcamstream/WebOverlayService.kt](android/src/main/java/com/webcamstream/WebOverlayService.kt) | Legacy WebView bitmap capture, viewport/zoom handling, and bounded capture scheduling. |
 | `GlCompositor` | [android/src/main/java/com/webcamstream/GlCompositor.kt](android/src/main/java/com/webcamstream/GlCompositor.kt) | Shader, texture, and framebuffer scaffolding exist. Actual GL draw path is unfinished. |
-| `RtmpClient` | [android/src/main/java/com/webcamstream/RtmpClient.kt](android/src/main/java/com/webcamstream/RtmpClient.kt) | Explicitly reports that Android RTMP streaming is not implemented. |
-| `BrowserCameraViewManager` | [android/src/main/java/com/webcamstream/BrowserCameraViewManager.kt](android/src/main/java/com/webcamstream/BrowserCameraViewManager.kt) | Bridges props and commands. Event callback wiring is still TODO. |
+| `GpuSceneRenderer` | [android/src/main/java/com/webcamstream/GpuSceneRenderer.kt](android/src/main/java/com/webcamstream/GpuSceneRenderer.kt) | Composes camera/browser textures into shared preview and encoder surfaces. |
+| `GpuBrowserOverlayService` | [android/src/main/java/com/webcamstream/GpuBrowserOverlayService.kt](android/src/main/java/com/webcamstream/GpuBrowserOverlayService.kt) | Supplies hardware WebView surfaces with stable identity, geometry, and cadence. |
+| `RtmpClient` | [android/src/main/java/com/webcamstream/RtmpClient.kt](android/src/main/java/com/webcamstream/RtmpClient.kt) | RootEncoder transport/recording integration, audio, session acknowledgments, and output finalization. |
+| `BrowserCameraViewManager` | [android/src/main/java/com/webcamstream/BrowserCameraViewManager.kt](android/src/main/java/com/webcamstream/BrowserCameraViewManager.kt) | Bridges props, commands, and native result/audio events. |
 
-Android should be treated as a future implementation lane. Do not present it as a
-working streaming backend until CameraX binding, GL compositing, RTMP publishing,
-recording, and React event dispatch are complete.
+Do not equate implementation with release qualification. Native compilation,
+physical orientation/animation/audio/save checks, and private RTMP endurance and
+reconnection tests remain required for this contribution's exact snapshot.
 
 ## Expo Integration
 
@@ -164,7 +166,7 @@ Dependency research and version notes live in [DEPENDENCIES.md](DEPENDENCIES.md)
 ## Known Architecture Gaps
 
 - Promise-returning native methods need tighter JavaScript bridge plumbing.
-- Android needs real CameraX lifecycle binding and frame delivery.
-- Android needs a complete EGL/OpenGL compositor and encoder/RTMP integration.
+- Android/iOS native compilation and device qualification must be repeated for this snapshot.
+- GPU mode is API 31+ and opt-in; legacy bitmap capture retains CPU/readback costs.
 - WebView audio is not mixed into the output; microphone audio is the current path.
 - Automated tests are light for a project with this much native behavior.

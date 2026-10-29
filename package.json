@@ -18,11 +18,13 @@
     "PROJECT_OVERVIEW.md",
     "ARCHITECTURE.md",
     "DEPENDENCIES.md",
+    "docs",
     "LICENSE"
   ],
   "scripts": {
-    "test": "jest",
-    "lint": "eslint .",
+    "test": "node --unhandled-rejections=strict --test tests/*.test.cjs",
+    "typecheck": "tsc --noEmit",
+    "lint": "npm run typecheck && node --test tests/native-source-policy.test.cjs",
     "build": "tsc",
     "prepare": "npm run build"
   },

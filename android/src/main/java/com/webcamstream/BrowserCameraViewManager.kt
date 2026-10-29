@@ -23,6 +23,8 @@ class BrowserCameraViewManager : SimpleViewManager<BrowserCameraView>() {
         const val COMMAND_INJECT_JS = 8
         const val COMMAND_SWITCH_CAMERA = 9
         const val COMMAND_SET_MUTED = 10
+        const val COMMAND_CONFIGURE_START = 11
+        const val COMMAND_STOP_WAIT = 12
     }
 
     override fun getName(): String {
@@ -64,6 +66,8 @@ class BrowserCameraViewManager : SimpleViewManager<BrowserCameraView>() {
 
     override fun getCommandsMap(): Map<String, Int> {
         return mapOf(
+            "configureAndStartStreaming" to COMMAND_CONFIGURE_START,
+            "stopStreamingAndWait" to COMMAND_STOP_WAIT,
             "startStreaming" to COMMAND_START_STREAMING,
             "stopStreaming" to COMMAND_STOP_STREAMING,
             "startRecording" to COMMAND_START_RECORDING,
@@ -79,6 +83,7 @@ class BrowserCameraViewManager : SimpleViewManager<BrowserCameraView>() {
 
     override fun getExportedCustomDirectEventTypeConstants(): Map<String, Any> {
         return mapOf(
+            "topStreamCommandResult" to mapOf("registrationName" to "onStreamCommandResult"),
             "topStreamStateChange" to mapOf("registrationName" to "onStreamStateChange"),
             "topStreamStats" to mapOf("registrationName" to "onStreamStats"),
             "topError" to mapOf("registrationName" to "onError"),
@@ -86,13 +91,24 @@ class BrowserCameraViewManager : SimpleViewManager<BrowserCameraView>() {
             "topWebViewError" to mapOf("registrationName" to "onWebViewError"),
             "topCameraReady" to mapOf("registrationName" to "onCameraReady"),
             "topLog" to mapOf("registrationName" to "onLog"),
+            "topAudioLevel" to mapOf("registrationName" to "onAudioLevel"),
             "topRecordingStateChange" to mapOf("registrationName" to "onRecordingStateChange"),
             "topRecordingFinished" to mapOf("registrationName" to "onRecordingFinished")
         )
     }
 
+    override fun receiveCommand(root: BrowserCameraView, commandId: String, args: ReadableArray?) {
+        val id = getCommandsMap()[commandId] ?: return
+        receiveCommand(root, id, args)
+    }
+
     override fun receiveCommand(root: BrowserCameraView, commandId: Int, args: ReadableArray?) {
         when (commandId) {
+            COMMAND_CONFIGURE_START -> root.configureAndStartStreaming(
+                args?.getMap(0)?.toHashMap() ?: emptyMap(),
+                args?.getString(1) ?: "", args?.getString(2) ?: ""
+            )
+            COMMAND_STOP_WAIT -> root.stopStreamingAndWait(args?.getString(0) ?: "", args?.getString(1) ?: "")
             COMMAND_START_STREAMING -> root.startStreaming()
             COMMAND_STOP_STREAMING -> root.stopStreaming()
             COMMAND_START_RECORDING -> root.startRecording()

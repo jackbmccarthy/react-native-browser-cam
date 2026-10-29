@@ -8,7 +8,171 @@
 import Foundation
 import AVFoundation
 import HaishinKit
+import Network
 import VideoToolbox
+
+// Single-consumer, generation-owned queue. Only video may be dropped under pressure.
+private final class BoundedFrameQueue<Element>: @unchecked Sendable {
+    enum Kind {
+        case video
+        case audio(duration: Double, bytes: Int)
+    }
+
+    enum Failure: Error, LocalizedError, Equatable {
+        case audioCapacityExceeded
+        case invalidAudioMetadata
+
+        var errorDescription: String? {
+            switch self {
+            case .audioCapacityExceeded:
+                return "Streaming audio backlog exceeded its bounded capacity; publisher stopped to avoid silent audio loss."
+            case .invalidAudioMetadata:
+                return "Streaming audio has invalid duration or byte size; publisher stopped to avoid unbounded buffering."
+            }
+        }
+    }
+
+    enum Admission: Equatable {
+        case accepted, droppedVideo, closed
+        case failed(Failure)
+    }
+
+    private struct Entry {
+        let element: Element
+        let kind: Kind
+    }
+
+    private let lock = NSLock()
+    private var pending: [Entry] = []
+    private var waiter: CheckedContinuation<Element?, Never>?
+    private var finished = false
+    private var videoCount = 0
+    private var audioCount = 0
+    private var audioDuration = 0.0
+    private var audioBytes = 0
+    private var videoDrops = 0
+    // Pending budgets exclude the one frame currently being appended to the mixer.
+    private let maxVideoCount = 2
+    private let maxAudioDuration = 0.5
+    private let maxAudioBytes = 256 * 1024
+    private let maxAudioCount = 128
+
+    var hasVideoCapacity: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !finished && videoCount < maxVideoCount
+    }
+
+    // Call once for a candidate frame, only when a false result actually skips its render.
+    // This is not a reservation; enqueue must recheck after composition.
+    func shouldRenderVideoFrame() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !finished else { return false }
+        guard videoCount < maxVideoCount else {
+            if videoDrops < Int.max { videoDrops += 1 }
+            return false
+        }
+        return true
+    }
+
+    var droppedVideoCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return videoDrops
+    }
+
+    @discardableResult
+    func enqueue(_ element: Element, kind: Kind) -> Admission {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !finished else { return .closed }
+
+        switch kind {
+        case .video:
+            guard videoCount < maxVideoCount else {
+                if videoDrops < Int.max { videoDrops += 1 }
+                return .droppedVideo
+            }
+        case .audio(let duration, let bytes):
+            guard duration.isFinite, duration > 0, bytes > 0 else {
+                finishLocked()
+                return .failed(.invalidAudioMetadata)
+            }
+            // Subtraction avoids integer overflow for hostile/invalid buffer sizes.
+            guard duration <= maxAudioDuration - audioDuration,
+                  bytes <= maxAudioBytes - audioBytes,
+                  audioCount < maxAudioCount else {
+                finishLocked()
+                return .failed(.audioCapacityExceeded)
+            }
+        }
+
+        if let continuation = waiter {
+            waiter = nil
+            continuation.resume(returning: element)
+        } else {
+            switch kind {
+            case .video: videoCount += 1
+            case .audio(let duration, let bytes):
+                audioCount += 1
+                audioDuration += duration
+                audioBytes += bytes
+            }
+            // FIFO admission preserves interleaving and original timestamps. Dropping
+            // incoming video never reorders retained audio or retained video.
+            pending.append(Entry(element: element, kind: kind))
+        }
+        return .accepted
+    }
+
+    func next() async -> Element? {
+        await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { takeOrWait($0) }
+        }, onCancel: { self.finish() })
+    }
+
+    private func takeOrWait(_ continuation: CheckedContinuation<Element?, Never>) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !finished else {
+            continuation.resume(returning: nil)
+            return
+        }
+        guard !pending.isEmpty else {
+            precondition(waiter == nil, "BoundedFrameQueue requires exactly one consumer")
+            waiter = continuation
+            return
+        }
+        let entry = pending.removeFirst()
+        switch entry.kind {
+        case .video: videoCount -= 1
+        case .audio(let duration, let bytes):
+            audioCount -= 1
+            audioBytes -= bytes
+            audioDuration = audioCount == 0 ? 0 : max(0, audioDuration - duration)
+        }
+        continuation.resume(returning: entry.element)
+    }
+
+    func finish() {
+        lock.lock()
+        defer { lock.unlock() }
+        finishLocked()
+    }
+
+    private func finishLocked() {
+        finished = true
+        pending.removeAll(keepingCapacity: false)
+        videoCount = 0
+        audioCount = 0
+        audioBytes = 0
+        audioDuration = 0
+        let continuation = waiter
+        waiter = nil
+        continuation?.resume(returning: nil)
+    }
+}
 
 /// Service for RTMP streaming
 class StreamService: NSObject {
@@ -68,26 +232,37 @@ class StreamService: NSObject {
     
     // MARK: - Recording Properties
     
-    /// AVAssetWriter for local recording
+    /// AVAssetWriter for local recording; owned by recordingQueue after setup.
     private var assetWriter: AVAssetWriter?
-    
-    /// Video input for asset writer
     private var assetWriterVideoInput: AVAssetWriterInput?
-    
-    /// Audio input for asset writer
     private var assetWriterAudioInput: AVAssetWriterInput?
-    
-    /// Pixel buffer adaptor for video input
     private var assetWriterInputAdaptor: AVAssetWriterInputPixelBufferAdaptor?
-    
-    /// Is recording active
-    private(set) var isRecording: Bool = false
-    
-    /// Recording start time
     private var recordingStartTime: CMTime = .invalid
-    
-    /// Output file URL
     private var recordingUrl: URL?
+    private var recordingFailure: Error?
+    private var recordingVideoFrameCount = 0
+    private let recordingQueue = DispatchQueue(label: "com.webcamstream.recording")
+    // Only admission flags and stop subscribers use this short-held lock, never AV calls.
+    private let recordingStateLock = NSLock()
+    private var recordingActive = false
+    private var recordingProcessing = false
+    private var recordingGeneration = 0
+    private var recordingPendingVideo = 0
+    private var recordingPendingAudio = 0
+    private var recordingPendingAudioBytes = 0
+    private var recordingAdmissionFailed = false
+    private var recordingStopCompletions: [(Result<URL, Error>) -> Void] = []
+    var onRecordingFailure: ((Error) -> Void)?
+    var isRecording: Bool {
+        recordingStateLock.lock()
+        defer { recordingStateLock.unlock() }
+        return recordingActive
+    }
+    var isRecordingProcessing: Bool {
+        recordingStateLock.lock()
+        defer { recordingStateLock.unlock() }
+        return recordingProcessing
+    }
     
     /// Frames sent since last stats update (for FPS)
     private var statsFrameCount: Int = 0
@@ -106,27 +281,53 @@ class StreamService: NSObject {
     
     /// Status listener task
     private var statusTask: Task<Void, Error>?
+    private var connectTask: Task<Void, Never>?
+    private var teardownTask: Task<Void, Error>?
+    private var streamingGeneration = 0
+    var hasPublisher: Bool { rtmpConnection != nil || rtmpStream != nil || mediaMixer != nil }
+    private(set) var isDisconnecting = false
     
     enum FrameData {
         case video(CMSampleBuffer)
         case audio(CMSampleBuffer)
     }
     
-    /// Continuation for queueing frames strictly in order
-    private var frameContinuation: AsyncStream<FrameData>.Continuation?
+    /// Producer callbacks use only a locked, generation-local queue snapshot.
+    private let frameQueueLock = NSLock()
+    private var frameQueue: BoundedFrameQueue<FrameData>?
     
     /// Dedicated task to sequentially process frames and feed them to the encoder
     private var frameProcessingTask: Task<Void, Never>?
+
+    /// Whether the user still intends the RTMP stream to be live.
+    private var shouldMaintainConnection: Bool = false
+
+    /// Network route monitor used to recover from Wi-Fi changes and disconnects.
+    private let networkMonitor = NWPathMonitor()
+    private let networkMonitorQueue = DispatchQueue(label: "com.webcamstream.network.monitor")
+    private var networkPathSatisfied: Bool = true
+    private var networkPathSignature: String?
+    private var reconnectWorkItem: DispatchWorkItem?
+    private var reconnectAttempts: Int = 0
     
     // MARK: - Initialization
     
     override init() {
         super.init()
+        startNetworkMonitoring()
         print("[StreamService] Initialized")
     }
     
     deinit {
-        disconnect()
+        // Explicit owner cleanup performs/join async teardown. Deinit must not
+        // create a Task that retains an object already being deallocated.
+        networkMonitor.cancel()
+        reconnectWorkItem?.cancel()
+        statsTimer?.cancel()
+        connectTask?.cancel()
+        statusTask?.cancel()
+        finishFrameQueue()
+        frameProcessingTask?.cancel()
     }
     
     // MARK: - Public Methods
@@ -176,7 +377,18 @@ class StreamService: NSObject {
     }
     
     /// Connect to RTMP server and start streaming
-    func connect() {
+    func connect(reconnect: Bool = false) {
+        guard !isDisconnecting else { return }
+        if state == .streaming || (!reconnect && state == .connecting) {
+            return
+        }
+
+        shouldMaintainConnection = true
+        cancelReconnect()
+        if !reconnect {
+            reconnectAttempts = 0
+        }
+
         guard let url = rtmpUrl else {
             print("[StreamService] No RTMP URL configured")
             let error = NSError(domain: "StreamService", code: -1, userInfo: [NSLocalizedDescriptionKey: "No RTMP URL configured"])
@@ -190,6 +402,15 @@ class StreamService: NSObject {
             delegate?.streamService(self, didFailWithError: error)
             return
         }
+
+        guard networkPathSatisfied else {
+            let msg = "[StreamService] Network unavailable; waiting to reconnect..."
+            print(msg)
+            delegate?.streamService(self, didLog: msg)
+            state = .disconnected
+            delegate?.streamService(self, didChangeState: state)
+            return
+        }
         
         let connectUrl = serverUrl ?? url
         let connectMsg = "[StreamService] Connecting to configured RTMP server..."
@@ -199,65 +420,61 @@ class StreamService: NSObject {
         state = .connecting
         delegate?.streamService(self, didChangeState: state)
         
-        // Single sequential Task for the ENTIRE connect → publish flow
-        Task {
+        // A new publisher waits for every previous publisher's teardown.
+        let previousTeardown = teardownTask
+        let generation = streamingGeneration
+        connectTask = Task { @MainActor in
             do {
-                // Set up strict frame sequencing to prevent out-of-order timestamps
-                var continuation: AsyncStream<FrameData>.Continuation?
-                let frameStream = AsyncStream<FrameData> { cont in
-                    continuation = cont
-                }
-                self.frameContinuation = continuation
-                
-                self.frameProcessingTask = Task {
-                    for await frame in frameStream {
-                        guard let mediaMixer = self.mediaMixer else { continue }
-                        // Only feed frames after publish succeeds and the encoder is live.
-                        let currentState = self.state
-                        if currentState == .streaming {
-                            switch frame {
-                            case .video(let buffer):
-                                await mediaMixer.append(buffer)
-                            case .audio(let buffer):
-                                await mediaMixer.append(buffer)
-                            }
-                        }
-                    }
-                }
+                if let previousTeardown = previousTeardown { try await previousTeardown.value }
+                guard generation == self.streamingGeneration, !Task.isCancelled else { return }
+                // Install a generation-owned bounded queue only after publish succeeds.
                 
                 // Step 1: Create RTMP connection
                 let connection = RTMPConnection(requestTimeout: 15000)
                 rtmpConnection = connection
                 
                 // Status listener for LOGGING only (not for driving state)
-                statusTask = Task {
+                statusTask = Task { @MainActor in
                     for await status in await connection.status {
+                        guard generation == self.streamingGeneration, !Task.isCancelled else { return }
                         let msg = "[StreamService] 📡 RTMP status: \(status.code)"
                         print(msg)
                         await MainActor.run {
                             self.delegate?.streamService(self, didLog: msg)
                         }
+
+                        if self.isRecoverableRTMPStatus(status.code) {
+                            await MainActor.run {
+                guard generation == self.streamingGeneration, !Task.isCancelled else { return }
+                                self.handleConnectionInterrupted(reason: status.code)
+                            }
+                        }
                     }
                 }
                 
                 // Step 2: Connect to RTMP server
-                print("[StreamService] Step 1/5: Connecting to \(connectUrl)...")
+                print("[StreamService] Step 1/5: Connecting to configured RTMP server...")
                 _ = try await connection.connect(connectUrl)
+                guard generation == self.streamingGeneration, !Task.isCancelled else { return }
                 print("[StreamService] Step 1/5: ✅ Connected!")
                 
                 await MainActor.run {
+                guard generation == self.streamingGeneration, !Task.isCancelled else { return }
                     self.delegate?.streamService(self, didLog: "[StreamService] ✅ Connected to RTMP server")
                     self.delegate?.streamServiceDidConnect(self)
                 }
                 
                 // Step 3: Create RTMP stream
                 print("[StreamService] Step 2/5: Creating stream + mixer...")
+                guard generation == self.streamingGeneration, !Task.isCancelled else { return }
                 let stream = RTMPStream(connection: connection)
                 rtmpStream = stream
                 let mixer = MediaMixer()
                 mediaMixer = mixer
                 await mixer.addOutput(stream)
+                guard generation == self.streamingGeneration, !Task.isCancelled else { return }
                 await mixer.startRunning()
+                guard generation == self.streamingGeneration, !Task.isCancelled else { return }
                 print("[StreamService] Step 2/5: ✅ Stream object created and MediaMixer started")
                 
                 // Step 4: Configure codec settings
@@ -269,11 +486,16 @@ class StreamService: NSObject {
                 videoSettings.profileLevel = kVTProfileLevel_H264_Main_AutoLevel as String
                 videoSettings.isHardwareEncoderEnabled = true
                 await stream.setVideoSettings(videoSettings)
+                guard generation == self.streamingGeneration, !Task.isCancelled else { return }
+                // Bound HaishinKit's raw video encoder input before publish creates its stream.
+                await stream.setVideoInputBufferCounts(2)
+                guard generation == self.streamingGeneration, !Task.isCancelled else { return }
                 
                 var audioSettings = AudioCodecSettings()
                 audioSettings.bitRate = audioBitrate
                 audioSettings.format = .aac
                 await stream.setAudioSettings(audioSettings)
+                guard generation == self.streamingGeneration, !Task.isCancelled else { return }
                 print("[StreamService] Step 3/5: ✅ Codecs configured (video: \(outputWidth)x\(outputHeight) @ \(videoBitrate)bps)")
                 
                 // Step 5: Wait for createStream() to finish (RTMPStream.init fires it async)
@@ -282,13 +504,16 @@ class StreamService: NSObject {
                 var waited = 0
                 while await stream.readyState != .idle && waited < maxWait {
                     try await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                guard generation == self.streamingGeneration, !Task.isCancelled else { return }
                     waited += 1
                 }
                 
                 let readyState = await stream.readyState
+                guard generation == self.streamingGeneration, !Task.isCancelled else { return }
                 print("[StreamService] Step 4/5: readyState=\(readyState), waited \(waited * 100)ms")
                 
                 await MainActor.run {
+                guard generation == self.streamingGeneration, !Task.isCancelled else { return }
                     self.delegate?.streamService(self, didLog: "[StreamService] Stream ready: state=\(readyState)")
                 }
                 
@@ -296,6 +521,7 @@ class StreamService: NSObject {
                     let errMsg = "[StreamService] ❌ Stream never became ready (stuck at \(readyState))"
                     print(errMsg)
                     await MainActor.run {
+                guard generation == self.streamingGeneration, !Task.isCancelled else { return }
                         self.delegate?.streamService(self, didLog: errMsg)
                         self.state = .error
                         self.delegate?.streamService(self, didChangeState: .error)
@@ -306,16 +532,21 @@ class StreamService: NSObject {
                 // Step 6: PUBLISH!
                 print("[StreamService] Step 5/5: Publishing with configured stream key...")
                 await MainActor.run {
+                guard generation == self.streamingGeneration, !Task.isCancelled else { return }
                     self.delegate?.streamService(self, didLog: "[StreamService] 🚀 Publishing...")
                 }
                 
-                let response = try await stream.publish(key)
-                print("[StreamService] 🎉 PUBLISH SUCCEEDED! Response: \(response)")
+                guard generation == self.streamingGeneration, !Task.isCancelled else { return }
+                _ = try await stream.publish(key)
+                guard generation == self.streamingGeneration, !Task.isCancelled else { return }
+                print("[StreamService] Publish succeeded")
                 
                 // publish() returns AFTER NetStream.Publish.Start
                 // → outgoing.startRunning() has been called
                 // → encoder is ready for frames
                 await MainActor.run {
+                guard generation == self.streamingGeneration, !Task.isCancelled else { return }
+                    self.startFrameQueue(stream: stream, mixer: mixer, generation: generation)
                     self.state = .streaming
                     self.streamStartTime = Date()
                     self.startStatsTimer()
@@ -324,6 +555,7 @@ class StreamService: NSObject {
                 }
                 
             } catch {
+                guard generation == self.streamingGeneration, !Task.isCancelled else { return }
                 let errorMsg: String
                 if let rtmpError = error as? RTMPStream.Error {
                     switch rtmpError {
@@ -331,82 +563,67 @@ class StreamService: NSObject {
                         errorMsg = "[StreamService] ❌ Failed: invalidState"
                     case .requestTimedOut:
                         errorMsg = "[StreamService] ❌ Failed: requestTimedOut (15s)"
-                    case .requestFailed(let response):
-                        errorMsg = "[StreamService] ❌ Failed: requestFailed - \(response)"
+                    case .requestFailed:
+                        errorMsg = "[StreamService] Failed: requestFailed"
                     }
                 } else {
-                    errorMsg = "[StreamService] ❌ Failed: \(error)"
+                    errorMsg = "[StreamService] Streaming operation failed"
                 }
                 print(errorMsg)
                 await MainActor.run {
+                guard generation == self.streamingGeneration, !Task.isCancelled else { return }
                     self.delegate?.streamService(self, didLog: errorMsg)
                     self.state = .error
                     self.delegate?.streamService(self, didFailWithError: error)
                     self.delegate?.streamService(self, didChangeState: .error)
+                    if self.shouldMaintainConnection, self.reconnectAttempts > 0 {
+                        self.scheduleReconnect(reason: "Connect failed")
+                    }
                 }
             }
         }
     }
     
     /// Disconnect from RTMP server
-    func disconnect() {
-        print("[StreamService] Disconnecting...")
-        
-        stopStatsTimer()
-        statusTask?.cancel()
-        statusTask = nil
-        
-        frameContinuation?.finish()
-        frameContinuation = nil
-        frameProcessingTask?.cancel()
-        frameProcessingTask = nil
-        
-        let connection = rtmpConnection
-        let stream = rtmpStream
-        let mixer = mediaMixer
-        
-        rtmpStream = nil
-        rtmpConnection = nil
-        mediaMixer = nil
-        
-        Task {
-            if let mixer = mixer, let stream = stream {
-                await mixer.removeOutput(stream)
-                await mixer.stopRunning()
-            } else if let mixer = mixer {
-                await mixer.stopRunning()
-            }
-            if let stream = stream {
-                _ = try? await stream.close()
-            }
-            if let connection = connection {
-                try? await connection.close()
+    func disconnect(completion: ((Error?) -> Void)? = nil) {
+        shouldMaintainConnection = false
+        reconnectAttempts = 0
+        cancelReconnect()
+        isDisconnecting = true
+        let teardown = tearDownStreamingResources()
+        let generation = streamingGeneration
+        Task { @MainActor in
+            do {
+                try await teardown.value
+                guard generation == self.streamingGeneration else {
+                    completion?(NSError(domain: "StreamService", code: -4, userInfo: [NSLocalizedDescriptionKey: "Teardown superseded"]))
+                    return
+                }
+                isDisconnecting = false
+                state = .disconnected
+                streamStartTime = nil
+                totalFrameCount = 0
+                totalAudioBufferCount = 0
+                delegate?.streamService(self, didChangeState: state)
+                delegate?.streamServiceDidDisconnect(self)
+                completion?(nil)
+            } catch {
+                // Failed closure stays fenced. Never acknowledge a timeout or failed close as teardown.
+                completion?(error)
             }
         }
-        
-        state = .disconnected
-        streamStartTime = nil
-        totalFrameCount = 0
-        totalAudioBufferCount = 0
-        delegate?.streamService(self, didChangeState: state)
-        delegate?.streamServiceDidDisconnect(self)
     }
     
     // MARK: - Recording Methods
     
-    /// Start local recording
+    /// Start local recording. The view/manager owns this setup on Main.
     @objc func startRecording(to fileUrl: URL) {
-        guard !isRecording else { return }
-        
+        guard !isRecording, !isRecordingProcessing else { return }
         do {
-            // Remove existing file
             if FileManager.default.fileExists(atPath: fileUrl.path) {
                 try FileManager.default.removeItem(at: fileUrl)
             }
-            
             let writer = try AVAssetWriter(outputURL: fileUrl, fileType: .mp4)
-            
-            // Video Input
             let videoSettings: [String: Any] = [
                 AVVideoCodecKey: AVVideoCodecType.h264,
                 AVVideoWidthKey: outputWidth,
@@ -414,177 +631,351 @@ class StreamService: NSObject {
             ]
             let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
             videoInput.expectsMediaDataInRealTime = true
-            
-            // Pixel Buffer Adaptor (for better performance/timing)
-            let sourcePixelBufferAttributes: [String: Any] = [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-                kCVPixelBufferWidthKey as String: outputWidth,
-                kCVPixelBufferHeightKey as String: outputHeight
-            ]
             let adaptor = AVAssetWriterInputPixelBufferAdaptor(
                 assetWriterInput: videoInput,
-                sourcePixelBufferAttributes: sourcePixelBufferAttributes
+                sourcePixelBufferAttributes: [
+                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                    kCVPixelBufferWidthKey as String: outputWidth,
+                    kCVPixelBufferHeightKey as String: outputHeight
+                ]
             )
-            
-            // Audio Input
-            let audioSettings: [String: Any] = [
+            let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: [
                 AVFormatIDKey: kAudioFormatMPEG4AAC,
-                AVNumberOfChannelsKey: 1, // Mono
+                AVNumberOfChannelsKey: 1,
                 AVSampleRateKey: 44100,
                 AVEncoderBitRateKey: 128000
-            ]
-            let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+            ])
             audioInput.expectsMediaDataInRealTime = true
-            
-            if writer.canAdd(videoInput) {
-                writer.add(videoInput)
+            guard writer.canAdd(videoInput), writer.canAdd(audioInput) else {
+                recordingQueue.async { writer.cancelWriting() }
+                return
             }
-            if writer.canAdd(audioInput) {
-                writer.add(audioInput)
+            writer.add(videoInput)
+            writer.add(audioInput)
+            guard writer.startWriting(), writer.status == .writing else {
+                if writer.status == .writing || writer.status == .unknown {
+                    recordingQueue.async { writer.cancelWriting() }
+                }
+                return
             }
-            
-            if writer.startWriting() {
-                self.assetWriter = writer
-                self.assetWriterVideoInput = videoInput
-                self.assetWriterAudioInput = audioInput
-                self.assetWriterInputAdaptor = adaptor
-                self.isRecording = true
-                self.recordingStartTime = .invalid
-                self.recordingUrl = fileUrl
-                print("[StreamService] 🔴 Recording started: \(fileUrl.lastPathComponent)")
-            } else {
-                print("[StreamService] ❌ Failed to start writing: \(String(describing: writer.error))")
-            }
-            
+            assetWriter = writer
+            assetWriterVideoInput = videoInput
+            assetWriterAudioInput = audioInput
+            assetWriterInputAdaptor = adaptor
+            recordingUrl = fileUrl
+            recordingStartTime = .invalid
+            recordingFailure = nil
+            recordingVideoFrameCount = 0
+            recordingStateLock.lock()
+            recordingGeneration += 1
+            recordingAdmissionFailed = false
+            recordingActive = true
+            recordingStateLock.unlock()
         } catch {
-            print("[StreamService] ❌ Failed to start recording: \(error)")
+            // The view reports one sanitized RECORDING_FAILED start event.
+            return
         }
     }
-    
-    /// Stop local recording
+
+    /// Kept for native selector compatibility; the URL is now delivered asynchronously.
     @objc func stopRecording() -> URL? {
-        guard isRecording, let writer = assetWriter else { return nil }
-        
-        isRecording = false
-        let url = recordingUrl
-        
-        // Finish writing
-        let semaphore = DispatchSemaphore(value: 0)
-        
-        writer.finishWriting {
-            semaphore.signal()
+        stopRecordingAsync { _ in }
+        return nil
+    }
+
+    func stopRecordingAsync(completion: @escaping (Result<URL, Error>) -> Void) {
+        recordingStateLock.lock()
+        guard recordingActive || recordingProcessing else {
+            recordingStateLock.unlock()
+            DispatchQueue.main.async { completion(.failure(self.recordingError("No active recording"))) }
+            return
         }
-        
-        semaphore.wait()
-        print("[StreamService] ⏹️ Recording stopped")
-        
-        // Cleanup
+        recordingStopCompletions.append(completion)
+        if recordingProcessing {
+            recordingStateLock.unlock()
+            return
+        }
+        recordingActive = false
+        recordingProcessing = true
+        // Enqueue under the admission lock, after every previously admitted frame.
+        recordingQueue.async { self.finalizeRecording() }
+        recordingStateLock.unlock()
+    }
+
+    private func recordingError(_ message: String) -> Error {
+        NSError(domain: "StreamService.Recording", code: -1, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+
+    private func failRecording(_ error: Error) {
+        guard recordingFailure == nil else { return }
+        recordingFailure = error
+        recordingStateLock.lock()
+        let generation = recordingGeneration
+        recordingStateLock.unlock()
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.recordingStateLock.lock()
+            let current = self.recordingActive && self.recordingGeneration == generation
+            self.recordingStateLock.unlock()
+            guard current else { return }
+            self.onRecordingFailure?(error)
+        }
+    }
+
+    private func finalizeRecording() {
+        guard let writer = assetWriter else {
+            completeRecording(writer: nil, result: .failure(recordingError("Recording writer unavailable")))
+            return
+        }
+        if recordingFailure == nil && (writer.status != .writing || recordingVideoFrameCount == 0) {
+            recordingFailure = writer.error ?? recordingError("Recording contains no writable video session")
+        }
+        if let failure = recordingFailure {
+            if writer.status == .writing || writer.status == .unknown { writer.cancelWriting() }
+            completeRecording(writer: writer, result: .failure(failure))
+            return
+        }
+        assetWriterVideoInput?.markAsFinished()
+        assetWriterAudioInput?.markAsFinished()
+        let url = recordingUrl
+        writer.finishWriting {
+            self.recordingQueue.async {
+                // AV completion may be delayed or duplicated; only its original writer owns cleanup.
+                guard self.assetWriter === writer else { return }
+                let result: Result<URL, Error>
+                if writer.status == .completed, writer.error == nil, let url = url {
+                    result = .success(url)
+                } else {
+                    result = .failure(writer.error ?? self.recordingError("Recording finalization failed"))
+                }
+                self.completeRecording(writer: writer, result: result)
+            }
+        }
+    }
+
+    private func completeRecording(writer: AVAssetWriter?, result: Result<URL, Error>) {
+        guard assetWriter === writer else { return }
         assetWriter = nil
         assetWriterVideoInput = nil
         assetWriterAudioInput = nil
         assetWriterInputAdaptor = nil
-        
-        return url
+        recordingUrl = nil
+        recordingStartTime = .invalid
+        recordingFailure = nil
+        recordingVideoFrameCount = 0
+        recordingStateLock.lock()
+        let completions = recordingStopCompletions
+        recordingStopCompletions.removeAll()
+        recordingProcessing = false
+        recordingAdmissionFailed = false
+        recordingStateLock.unlock()
+        DispatchQueue.main.async { completions.forEach { $0(result) } }
     }
-    
+
     @objc func recordVideoFrame(_ sampleBuffer: CMSampleBuffer) {
-        guard isRecording,
-              let writer = assetWriter,
-              let videoInput = assetWriterVideoInput,
-              let adaptor = assetWriterInputAdaptor,
-              writer.status == .writing else { return }
-        
+        recordingStateLock.lock()
+        defer { recordingStateLock.unlock() }
+        // Include the in-flight append: at most one additional video buffer is retained.
+        guard recordingActive, !recordingAdmissionFailed, recordingPendingVideo < 2 else { return }
+        recordingPendingVideo += 1
+        recordingQueue.async {
+            self.appendRecordingVideoFrame(sampleBuffer)
+            self.recordingStateLock.lock()
+            self.recordingPendingVideo -= 1
+            self.recordingStateLock.unlock()
+        }
+    }
+
+    private func appendRecordingVideoFrame(_ sampleBuffer: CMSampleBuffer) {
+        guard recordingFailure == nil, let writer = assetWriter,
+              let input = assetWriterVideoInput, let adaptor = assetWriterInputAdaptor else { return }
+        guard writer.status == .writing else {
+            failRecording(writer.error ?? recordingError("Recording writer stopped accepting video"))
+            return
+        }
+        guard input.isReadyForMoreMediaData else { return }
         if recordingStartTime == .invalid {
             writer.startSession(atSourceTime: sampleBuffer.presentationTimeStamp)
             recordingStartTime = sampleBuffer.presentationTimeStamp
         }
-        
-        if videoInput.isReadyForMoreMediaData {
-            // Need to append PixelBuffer via adaptor for reliability with AVAssetWriter
-            if let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
-                adaptor.append(pixelBuffer, withPresentationTime: sampleBuffer.presentationTimeStamp)
-            } else {
-                videoInput.append(sampleBuffer)
+        let appended: Bool
+        if let image = CMSampleBufferGetImageBuffer(sampleBuffer) {
+            appended = adaptor.append(image, withPresentationTime: sampleBuffer.presentationTimeStamp)
+        } else {
+            appended = input.append(sampleBuffer)
+        }
+        guard appended, writer.status == .writing else {
+            failRecording(writer.error ?? recordingError("Recording video append failed"))
+            return
+        }
+        recordingVideoFrameCount += 1
+    }
+
+    @objc func recordAudioFrame(_ sampleBuffer: CMSampleBuffer) {
+        recordingStateLock.lock()
+        defer { recordingStateLock.unlock() }
+        guard recordingActive, !recordingAdmissionFailed else { return }
+        let bytes = CMSampleBufferGetTotalSampleSize(sampleBuffer)
+        // Audio is never silently dropped on overload. Fence all further admission
+        // and report one failure after already-admitted buffers have been processed.
+        guard bytes > 0, recordingPendingAudio < 128,
+              bytes <= 256 * 1024 - recordingPendingAudioBytes else {
+            recordingAdmissionFailed = true
+            recordingQueue.async {
+                self.failRecording(self.recordingError("Recording audio backlog exceeded its bounded capacity"))
             }
+            return
+        }
+        recordingPendingAudio += 1
+        recordingPendingAudioBytes += bytes
+        recordingQueue.async {
+            self.appendRecordingAudioFrame(sampleBuffer)
+            self.recordingStateLock.lock()
+            self.recordingPendingAudio -= 1
+            self.recordingPendingAudioBytes -= bytes
+            self.recordingStateLock.unlock()
         }
     }
-    
-    @objc func recordAudioFrame(_ sampleBuffer: CMSampleBuffer) {
-        guard isRecording,
-              let writer = assetWriter,
-              let audioInput = assetWriterAudioInput,
-              writer.status == .writing,
-              recordingStartTime != .invalid else { return } // Wait for video to start session
-        
-        if audioInput.isReadyForMoreMediaData {
-            audioInput.append(sampleBuffer)
+
+    private func appendRecordingAudioFrame(_ sampleBuffer: CMSampleBuffer) {
+        guard recordingFailure == nil, let writer = assetWriter, let input = assetWriterAudioInput else { return }
+        guard writer.status == .writing else {
+            failRecording(writer.error ?? recordingError("Recording writer stopped accepting audio"))
+            return
+        }
+        guard recordingStartTime != .invalid, input.isReadyForMoreMediaData else { return }
+        guard input.append(sampleBuffer), writer.status == .writing else {
+            failRecording(writer.error ?? recordingError("Recording audio append failed"))
+            return
         }
     }
     
     /// Stop publishing stream
     func stopPublishing() {
-        print("[StreamService] Stop publishing...")
-        let stream = rtmpStream
-        Task {
-            _ = try? await stream?.close()
-        }
+        disconnect()
     }
     
-    /// Send video frame to stream
+    /// Advisory only: enqueue still checks atomically after potentially expensive composition.
+    var canAcceptVideoFrame: Bool { currentFrameQueue()?.hasVideoCapacity ?? false }
+
+    /// Call once when deciding whether to skip a non-recording frame's composition.
+    func shouldRenderVideoFrame() -> Bool { currentFrameQueue()?.shouldRenderVideoFrame() ?? false }
+
+    @MainActor
+    private func startFrameQueue(stream: RTMPStream, mixer: MediaMixer, generation: Int) {
+        let queue = BoundedFrameQueue<FrameData>()
+        frameQueueLock.lock()
+        precondition(frameQueue == nil, "Previous publisher queue must be finished before replacement")
+        frameQueue = queue
+        frameQueueLock.unlock()
+
+        // Capture this publisher's stream and mixer; never fetch replacements after an await.
+        frameProcessingTask = Task { @MainActor [weak self] in
+            while let frame = await queue.next() {
+                guard let self = self, generation == self.streamingGeneration,
+                      !Task.isCancelled else { break }
+                switch frame {
+                case .video(let buffer): await stream.append(buffer)
+                case .audio(let buffer): await mixer.append(buffer)
+                }
+                guard generation == self.streamingGeneration, !Task.isCancelled else { break }
+                // Counters reflect encoder/mixer admission, not actual encoded delivery.
+                // HaishinKit's bounded video queue can drop frames internally.
+                switch frame {
+                case .video:
+                    self.totalFrameCount += 1
+                    self.statsFrameCount += 1
+                case .audio:
+                    self.totalAudioBufferCount += 1
+                }
+            }
+            queue.finish()
+        }
+    }
+
+    private func currentFrameQueue(audio: Bool = false) -> BoundedFrameQueue<FrameData>? {
+        frameQueueLock.lock()
+        defer { frameQueueLock.unlock() }
+        return audio && isMuted ? nil : frameQueue
+    }
+
+    private func isCurrentFrameQueue(_ queue: BoundedFrameQueue<FrameData>) -> Bool {
+        frameQueueLock.lock()
+        defer { frameQueueLock.unlock() }
+        return frameQueue === queue
+    }
+
+    private func finishFrameQueue() {
+        frameQueueLock.lock()
+        let queue = frameQueue
+        frameQueue = nil
+        // Finish under the admission-pointer lock so no callback can acquire a new
+        // generation while this one still accepts work. Producer snapshots remain local.
+        queue?.finish()
+        frameQueueLock.unlock()
+    }
+
+    /// Send video frame to stream. Admission is open only after publish succeeds.
     func sendVideoFrame(_ sampleBuffer: CMSampleBuffer) {
-        guard state == .streaming else {
-            if CFAbsoluteTimeGetCurrent().truncatingRemainder(dividingBy: 5.0) < 0.1 {
-                print("[StreamService] ✋ Video frame rejected - State is \(state.rawValue)")
-            }
-            return
-        }
-
-        guard mediaMixer != nil else {
-            if CFAbsoluteTimeGetCurrent().truncatingRemainder(dividingBy: 5.0) < 0.1 {
-                print("[StreamService] ❌ Video frame rejected - mediaMixer is NIL")
-            }
-            return
-        }
-
-        totalFrameCount += 1
-        statsFrameCount += 1
-        
-        if totalFrameCount % 100 == 0 {
-            let pts = sampleBuffer.presentationTimeStamp.seconds
-            let duration = sampleBuffer.duration.seconds
-            let msg = "[StreamService] 📤 Queued 100 video frames to MediaMixer (Total: \(totalFrameCount), PTS: \(String(format: "%.3f", pts)), Dur: \(String(format: "%.3f", duration)))"
-            print(msg)
-            Task { @MainActor in
-                self.delegate?.streamService(self, didLog: msg)
-            }
-        }
-
-        frameContinuation?.yield(.video(sampleBuffer))
+        guard let queue = currentFrameQueue() else { return }
+        queue.enqueue(.video(sampleBuffer), kind: .video)
     }
-    
-    /// Send audio buffer to stream
+
+    /// Audio is never evicted to make room for video. A bounded overload is a failure.
     func sendAudioBuffer(_ sampleBuffer: CMSampleBuffer) {
-        guard state == .streaming, !isMuted, mediaMixer != nil else { return }
-        
-        totalAudioBufferCount += 1
-        if totalAudioBufferCount % 100 == 0 {
-            let pts = sampleBuffer.presentationTimeStamp.seconds
-            let duration = sampleBuffer.duration.seconds
-            let msg = "[StreamService] 🎤 Queued 100 audio buffers to MediaMixer (Total: \(totalAudioBufferCount), PTS: \(String(format: "%.3f", pts)), Dur: \(String(format: "%.3f", duration)))"
-            print(msg)
-            Task { @MainActor in
-                self.delegate?.streamService(self, didLog: msg)
+        guard let queue = currentFrameQueue(audio: true) else { return }
+        var duration = sampleBuffer.duration.seconds
+        if let format = CMSampleBufferGetFormatDescription(sampleBuffer),
+           let description = CMAudioFormatDescriptionGetStreamBasicDescription(format) {
+            let rate = description.pointee.mSampleRate
+            let samples = CMSampleBufferGetNumSamples(sampleBuffer)
+            if rate.isFinite, rate > 0, samples > 0 { duration = Double(samples) / rate }
+        }
+        let bytes = CMSampleBufferGetTotalSampleSize(sampleBuffer)
+        if case .failed(let failure) = queue.enqueue(.audio(sampleBuffer), kind: .audio(duration: duration, bytes: bytes)) {
+            Task { @MainActor [weak self] in
+                guard let self = self, self.isCurrentFrameQueue(queue) else { return }
+                await self.failFrameQueue(queue, failure: failure)
             }
         }
-        
-        frameContinuation?.yield(.audio(sampleBuffer))
     }
-    
+
+    @MainActor
+    private func failFrameQueue(_ queue: BoundedFrameQueue<FrameData>, failure: BoundedFrameQueue<FrameData>.Failure) async {
+        guard isCurrentFrameQueue(queue) else { return }
+        // Controlled failure: join the normal teardown, but do not run disconnect's
+        // success transition, which would hide this error with a later .disconnected.
+        shouldMaintainConnection = false
+        reconnectAttempts = 0
+        cancelReconnect()
+        isDisconnecting = true
+        let teardown = tearDownStreamingResources()
+        let generation = streamingGeneration
+        state = .error
+        delegate?.streamService(self, didFailWithError: failure)
+        delegate?.streamService(self, didChangeState: .error)
+
+        do {
+            try await teardown.value
+            guard generation == streamingGeneration else { return }
+            isDisconnecting = false
+            streamStartTime = nil
+            totalFrameCount = 0
+            totalAudioBufferCount = 0
+            delegate?.streamServiceDidDisconnect(self)
+        } catch {
+            guard generation == streamingGeneration else { return }
+            // A failed close remains fenced; the original queue failure stays visible.
+            delegate?.streamService(self, didLog: "[StreamService] Frame queue teardown failed")
+        }
+    }
+
     /// Mute/unmute audio
     func setMuted(_ muted: Bool) {
+        frameQueueLock.lock()
         isMuted = muted
+        frameQueueLock.unlock()
         print("[StreamService] Muted: \(muted)")
-        // In HK 2.0.9, we simply check !isMuted in sendAudioBuffer
     }
     
     /// Get current stream statistics (async-to-sync bridge)
@@ -600,7 +991,7 @@ class StreamService: NSObject {
     
     /// Update stream configuration dynamically
     func updateConfig(_ config: [String: Any]) {
-        print("[StreamService] Update config: \(config)")
+        print("[StreamService] Update config")
         
         let stream = rtmpStream
         
@@ -650,6 +1041,155 @@ class StreamService: NSObject {
     }
     
     // MARK: - Private Methods
+
+    private func startNetworkMonitoring() {
+        networkMonitor.pathUpdateHandler = { [weak self] path in
+            guard let self = self else { return }
+
+            let signature = self.networkSignature(for: path)
+            let previousSignature = self.networkPathSignature
+            let routeChanged = previousSignature != nil && previousSignature != signature
+            self.networkPathSignature = signature
+            self.networkPathSatisfied = path.status == .satisfied
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, self.shouldMaintainConnection else { return }
+
+                if path.status != .satisfied {
+                    self.handleConnectionInterrupted(reason: "Network unavailable")
+                    return
+                }
+
+                if routeChanged && (self.state == .streaming || self.state == .connecting) {
+                    self.handleConnectionInterrupted(reason: "Network route changed")
+                } else if self.state == .disconnected || self.state == .error {
+                    self.scheduleReconnect(reason: "Network available")
+                }
+            }
+        }
+        networkMonitor.start(queue: networkMonitorQueue)
+    }
+
+    private func networkSignature(for path: NWPath) -> String {
+        var interfaces: [String] = []
+        if path.usesInterfaceType(.wifi) {
+            interfaces.append("wifi")
+        }
+        if path.usesInterfaceType(.cellular) {
+            interfaces.append("cellular")
+        }
+        if path.usesInterfaceType(.wiredEthernet) {
+            interfaces.append("wired")
+        }
+        if path.usesInterfaceType(.loopback) {
+            interfaces.append("loopback")
+        }
+        if path.usesInterfaceType(.other) {
+            interfaces.append("other")
+        }
+        return "\(path.status)-\(interfaces.joined(separator: ","))"
+    }
+
+    private func isRecoverableRTMPStatus(_ code: String) -> Bool {
+        return code == RTMPConnection.Code.connectClosed.rawValue
+            || code == RTMPConnection.Code.connectFailed.rawValue
+    }
+
+    private func handleConnectionInterrupted(reason: String) {
+        guard shouldMaintainConnection else { return }
+        guard state == .streaming || state == .connecting else { return }
+
+        let msg = "[StreamService] Network interruption detected (\(reason)); reconnecting..."
+        print(msg)
+        delegate?.streamService(self, didLog: msg)
+
+        tearDownStreamingResources()
+        state = .disconnected
+        delegate?.streamService(self, didChangeState: state)
+        scheduleReconnect(reason: reason)
+    }
+
+    private func scheduleReconnect(reason: String) {
+        guard shouldMaintainConnection, networkPathSatisfied else { return }
+        guard reconnectWorkItem == nil else { return }
+        guard state != .streaming && state != .connecting else { return }
+
+        reconnectAttempts += 1
+        let delay = min(pow(2.0, Double(max(0, reconnectAttempts - 1))), 10.0)
+        let msg = "[StreamService] Scheduling RTMP reconnect attempt \(reconnectAttempts) in \(String(format: "%.1f", delay))s (\(reason))"
+        print(msg)
+        delegate?.streamService(self, didLog: msg)
+        state = .connecting
+        delegate?.streamService(self, didChangeState: state)
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.reconnectWorkItem = nil
+            guard self.shouldMaintainConnection else { return }
+            self.connect(reconnect: true)
+        }
+
+        reconnectWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func cancelReconnect() {
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
+    }
+
+    @discardableResult
+    private func tearDownStreamingResources() -> Task<Void, Error> {
+        streamingGeneration += 1
+        stopStatsTimer()
+        let connecting = connectTask
+        connectTask = nil
+        connecting?.cancel()
+        let status = statusTask
+        statusTask = nil
+        status?.cancel()
+        let frames = frameProcessingTask
+        finishFrameQueue()
+        frameProcessingTask = nil
+        frames?.cancel()
+        let previous = teardownTask
+
+        let task = Task { @MainActor in
+            var failure: Error?
+            if let previous = previous {
+                do { try await previous.value } catch { failure = error }
+            }
+            // Cancellation alone does not stop HaishinKit continuations. Join the connect flow
+            // before taking ownership of its final resource set.
+            await connecting?.value
+            await frames?.value
+            let connection = self.rtmpConnection
+            let stream = self.rtmpStream
+            let mixer = self.mediaMixer
+            self.rtmpStream = nil
+            self.rtmpConnection = nil
+            self.mediaMixer = nil
+            if let mixer = mixer {
+                if let stream = stream { await mixer.removeOutput(stream) }
+                await mixer.stopRunning()
+            }
+            if let stream = stream {
+                let ready = await stream.readyState
+                if ready == .publishing || ready == .playing {
+                    do { _ = try await stream.close() } catch { failure = error }
+                }
+            }
+            // Even when unpublish fails, close the transport. An invalid-state error is
+            // conservatively a failed acknowledgment, not proof that the socket is closed.
+            if let connection = connection {
+                do { try await connection.close() } catch { failure = error }
+            }
+            _ = try? await status?.value
+            if let failure = failure { throw failure }
+        }
+        teardownTask = task
+        return task
+    }
     
     /// Parse RTMP URL into server URL and stream key
     private func parseRtmpUrl(_ url: String) {
@@ -690,6 +1230,7 @@ class StreamService: NSObject {
     
     /// Update stream statistics
     private func updateStats() {
+        if let queue = currentFrameQueue() { stats.droppedFrames = queue.droppedVideoCount }
         let now = Date()
         let elapsed = now.timeIntervalSince(lastFrameCountTime)
         if elapsed >= 1.0 {

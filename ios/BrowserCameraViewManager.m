@@ -18,15 +18,23 @@ RCT_EXPORT_VIEW_PROPERTY(streamConfig, NSDictionary)
 RCT_EXPORT_VIEW_PROPERTY(recordingConfig, NSDictionary)
 
 // Event callbacks
+RCT_EXPORT_VIEW_PROPERTY(onStreamCommandResult, RCTDirectEventBlock)
 RCT_EXPORT_VIEW_PROPERTY(onStreamStateChange, RCTDirectEventBlock)
 RCT_EXPORT_VIEW_PROPERTY(onStreamStats, RCTDirectEventBlock)
+RCT_EXPORT_VIEW_PROPERTY(onAudioLevel, RCTDirectEventBlock)
 RCT_EXPORT_VIEW_PROPERTY(onError, RCTDirectEventBlock)
 RCT_EXPORT_VIEW_PROPERTY(onWebViewLoad, RCTDirectEventBlock)
 RCT_EXPORT_VIEW_PROPERTY(onWebViewError, RCTDirectEventBlock)
 RCT_EXPORT_VIEW_PROPERTY(onCameraReady, RCTDirectEventBlock)
+RCT_EXPORT_VIEW_PROPERTY(onRecordingStateChange, RCTDirectEventBlock)
+RCT_EXPORT_VIEW_PROPERTY(onRecordingFinished, RCTDirectEventBlock)
 RCT_EXPORT_VIEW_PROPERTY(onLog, RCTDirectEventBlock)
 
 // Expose methods to React Native
+RCT_EXTERN_METHOD(configureAndStartStreaming : (nonnull NSNumber *)reactTag
+                  config : (NSDictionary *)config sessionId : (NSString *)sessionId commandId : (NSString *)commandId)
+RCT_EXTERN_METHOD(stopStreamingAndWait : (nonnull NSNumber *)reactTag
+                  sessionId : (NSString *)sessionId commandId : (NSString *)commandId)
 RCT_EXTERN_METHOD(startStreaming : (nonnull NSNumber *)reactTag)
 RCT_EXTERN_METHOD(stopStreaming : (nonnull NSNumber *)reactTag)
 RCT_EXTERN_METHOD(startRecording : (nonnull NSNumber *)reactTag)
@@ -38,6 +46,9 @@ RCT_EXTERN_METHOD(loadUrl : (nonnull NSNumber *)reactTag url : (NSString *)url)
 RCT_EXTERN_METHOD(injectJavaScript : (nonnull NSNumber *)
                       reactTag js : (NSString *)js)
 RCT_EXTERN_METHOD(switchCamera : (nonnull NSNumber *)reactTag)
+RCT_EXTERN_METHOD(focusAtPoint : (nonnull NSNumber *)reactTag
+                  x : (nonnull NSNumber *)x
+                  y : (nonnull NSNumber *)y)
 RCT_EXTERN_METHOD(setMuted : (nonnull NSNumber *)reactTag muted : (BOOL)muted)
 RCT_EXTERN_METHOD(getStreamState : (nonnull NSNumber *)reactTag resolver : (
     RCTPromiseResolveBlock)resolve rejecter : (RCTPromiseRejectBlock)reject)

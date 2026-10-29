@@ -13,8 +13,8 @@ Then use [ARCHITECTURE.md](ARCHITECTURE.md) for native implementation details an
 
 | Platform | Status |
 | --- | --- |
-| iOS | Tested on device; RTMP streaming and local recording appear to be working |
-| Android | Native API scaffold exists, but Android has not been tested yet |
+| iOS | Capture, overlays, RTMP, and recording implemented; this contribution still needs native rebuild/device qualification |
+| Android | CameraX, GPU composition, RTMP, audio, and recording implemented; this contribution still needs native rebuild/device qualification |
 | Expo | Supported through config plugin + development builds |
 | Expo Go | Not supported |
 | Web | Not supported |
@@ -23,8 +23,15 @@ Then use [ARCHITECTURE.md](ARCHITECTURE.md) for native implementation details an
 
 - Composites `WKWebView` / native web overlay content over live camera video
 - Streams the composited output to RTMP endpoints such as YouTube
-- Records the composited output locally on iOS
+- Records the composited output with microphone audio on iOS and Android
 - Exposes a single `BrowserCamView` component for React Native and Expo apps
+- Provides session-correlated streaming start/stop acknowledgments and native audio-level events
+
+Hardware camera IDs, input-device selection, and tap-to-focus are currently iOS-only.
+Android uses facing selection, its default microphone, and fallback device descriptors.
+
+See [the contribution notes](docs/CONTRIBUTION_NOTES.md) for the collected changes,
+verification boundaries, and intentionally excluded app-specific capture protocols.
 
 ## Expo Integration
 
@@ -56,7 +63,7 @@ npx expo run:ios
 
 - iOS Simulator does not provide a real camera capture path for this library, so end-to-end camera/stream testing still needs a physical iPhone or iPad.
 - Expo Camera can work in Expo Go because it is part of the Expo SDK. This library cannot, because it ships custom native code.
-- Once Android streaming is implemented, Android Emulator testing should be practical, but Android is not ready yet.
+- Android's GPU path is opt-in on supported devices; the legacy renderer remains available. Neither a passing JavaScript test nor a successful TypeScript build qualifies native capture, streaming, orientation, or recording on a device.
 
 ## React Native CLI
 
@@ -248,8 +255,9 @@ All runtime values should be passed in through these config props. Avoid hard-co
 - `setMuted(muted)`
 
 Some result-returning methods still need tighter native-to-JS promise plumbing.
-Today the native iOS side can create snapshot and recording paths, but the JS
-wrapper dispatches most methods as view-manager commands and may return placeholders.
+`snapshot()` and `getStreamStats()` still return JavaScript placeholders.
+`stopRecording()` instead waits for a nonempty native completion path and rejects
+on failure, unmount, or timeout. A local file path is not a Photos/gallery-save receipt.
 
 ## Permissions
 
@@ -258,15 +266,18 @@ The config plugin adds these permissions automatically:
 - iOS: camera, microphone, photo-library add access
 - Android: camera, microphone, internet, network state
 
+Android hosts must also obtain camera and microphone runtime permissions before
+mounting the view. Recording export requirements vary by Android version.
+
 ## Release Guidance
 
-If you publish this package today, describe it as:
+This contribution is a review candidate, not a native-qualified release. Keep the
+current package version until Android and iOS build/device checks have been repeated
+against the exact merged sources. No npm release is part of this contribution.
 
-- iOS-first, with successful device testing so far
-- Expo development-build compatible
-- Android support pending implementation/testing
-
-Do not market it as fully cross-platform until Android RTMP and recording are implemented.
+The existing iOS 15.1 and Android API 24 floors are unchanged. Android's GPU path
+requires API 31+ and uses `cameraConfig.androidRendering: 'gpu'`; older devices use
+the legacy path. Native SDK dependency versions are unchanged.
 
 ## License
 
